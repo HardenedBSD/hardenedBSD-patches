@@ -1,0 +1,4483 @@
+diff --git a/lib/libugidfw/ugidfw.c b/lib/libugidfw/ugidfw.c
+index 0dc423d..967c77a 100644
+--- a/lib/libugidfw/ugidfw.c
++++ b/lib/libugidfw/ugidfw.c
+@@ -36,6 +36,9 @@
+ #include <sys/sysctl.h>
+ #include <sys/ucred.h>
+ #include <sys/mount.h>
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <sys/sysctl.h>
+ 
+ #include <security/mac_bsdextended/mac_bsdextended.h>
+ 
+@@ -44,6 +47,8 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <fcntl.h>
++#include <unistd.h>
+ 
+ #include "ugidfw.h"
+ 
+@@ -329,14 +334,18 @@ bsde_rule_to_string(struct mac_bsdextended_rule *rule, char *buf, size_t buflen)
+ 			cur += len;
+ 		}
+ 		if (rule->mbr_object.mbo_flags & MBO_FSID_DEFINED) {
+-			numfs = getmntinfo(&mntbuf, MNT_NOWAIT);
+-			for (i = 0; i < numfs; i++)
+-				if (memcmp(&(rule->mbr_object.mbo_fsid),
+-				    &(mntbuf[i].f_fsid),
+-				    sizeof(mntbuf[i].f_fsid)) == 0)
+-					break;
+-			len = snprintf(cur, left, "filesys %s ", 
+-			    i == numfs ? "???" : mntbuf[i].f_mntonname);
++			if (rule->mbr_object.mbo_inode == 0) {
++				numfs = getmntinfo(&mntbuf, MNT_NOWAIT);
++				for (i = 0; i < numfs; i++)
++					if (memcmp(&(rule->mbr_object.mbo_fsid),
++								&(mntbuf[i].f_fsid),
++								sizeof(mntbuf[i].f_fsid)) == 0)
++						break;
++				len = snprintf(cur, left, "filesys %s ", 
++						i == numfs ? "???" : mntbuf[i].f_mntonname);
++			} else {
++				len = snprintf(cur, left, "filesys %s ", rule->mbr_object.mbo_paxpath);
++			}
+ 			if (len < 0 || len > left)
+ 				goto truncated;
+ 			left -= len;
+@@ -500,6 +509,50 @@ bsde_rule_to_string(struct mac_bsdextended_rule *rule, char *buf, size_t buflen)
+ 		cur += len;
+ 	}
+ 
++	if (rule->mbr_pax) {
++		len = snprintf(cur, left, " paxflags ");
++		if (len < 0 || len > left)
++			goto truncated;
++		left -= len;
++		cur += len;
++
++		if (rule->mbr_pax & MBI_FORCE_ASLR_ENABLED) {
++			len = snprintf(cur, left, "A");
++			if (len < 0 || len > left)
++				goto truncated;
++
++			left -= len;
++			cur += len;
++		}
++
++		if (rule->mbr_pax & MBI_FORCE_ASLR_DISABLED) {
++			len = snprintf(cur, left, "a");
++			if (len < 0 || len > left)
++				goto truncated;
++
++			left -= len;
++			cur += len;
++		}
++
++		if (rule->mbr_pax & MBI_FORCE_SEGVGUARD_ENABLED) {
++			len = snprintf(cur, left, "S");
++			if (len < 0 || len > left)
++				goto truncated;
++
++			left -= len;
++			cur += len;
++		}
++
++		if (rule->mbr_pax & MBI_FORCE_SEGVGUARD_DISABLED) {
++			len = snprintf(cur, left, "s");
++			if (len < 0 || len > left)
++				goto truncated;
++
++			left -= len;
++			cur += len;
++		}
++	}
++
+ 	return (0);
+ 
+ truncated:
+@@ -507,8 +560,8 @@ truncated:
+ }
+ 
+ int
+-bsde_parse_uidrange(char *spec, uid_t *min, uid_t *max,
+-    size_t buflen, char *errstr){
++bsde_parse_uidrange(char *spec, uid_t *min, uid_t *max, size_t buflen, char *errstr)
++{
+ 	struct passwd *pwd;
+ 	uid_t uid1, uid2;
+ 	char *spec1, *spec2, *endp;
+@@ -556,8 +609,8 @@ bsde_parse_uidrange(char *spec, uid_t *min, uid_t *max,
+ }
+ 
+ int
+-bsde_parse_gidrange(char *spec, gid_t *min, gid_t *max,
+-    size_t buflen, char *errstr){
++bsde_parse_gidrange(char *spec, gid_t *min, gid_t *max, size_t buflen, char *errstr)
++{
+ 	struct group *grp;
+ 	gid_t gid1, gid2;
+ 	char *spec1, *spec2, *endp;
+@@ -766,19 +819,38 @@ bsde_parse_type(char *spec, int *type, size_t buflen, char *errstr)
+ }
+ 
+ int
+-bsde_parse_fsid(char *spec, struct fsid *fsid, size_t buflen, char *errstr)
++bsde_parse_fsid(char *spec, struct fsid *fsid, ino_t *inode, size_t buflen, char *errstr)
+ {
+ 	size_t len;
+ 	struct statfs buf;
++	struct stat sb;
++	int fd, paxstatus;
++	size_t bufsz;
++
++	*inode = 0;
+ 
+ 	if (statfs(spec, &buf) < 0) {
+ 		len = snprintf(errstr, buflen, "Unable to get id for %s: %s",
+-		    spec, strerror(errno));
++				spec, strerror(errno));
+ 		return (-1);
+ 	}
+ 
+ 	*fsid = buf.f_fsid;
+ 
++	if (strcmp(buf.f_fstypename, "devfs") != 0) {
++		bufsz = sizeof(int);
++		if (!sysctlbyname("security.pax.aslr.status", &paxstatus, &bufsz, NULL, 0)) {
++			fd = open(spec, O_RDONLY);
++			if (fd != -1) {
++				if (fstat(fd, &sb) == 0)
++					if(S_ISDIR(sb.st_mode) == 0)
++						*inode = sb.st_ino;
++
++				close(fd);
++			}
++		}
++	}
++
+ 	return (0);
+ }
+ 
+@@ -852,13 +924,17 @@ bsde_parse_object(int argc, char *argv[],
+ 				return (-1);
+ 			}
+ 			if (bsde_parse_fsid(argv[current+1], &fsid,
+-			    buflen, errstr) < 0)
++			    &object->mbo_inode, buflen, errstr) < 0)
+ 				return (-1);
+ 			flags |= MBO_FSID_DEFINED;
+ 			if (nextnot) {
+ 				neg ^= MBO_FSID_DEFINED;
+ 				nextnot = 0;
+ 			}
++			if (object->mbo_inode)
++				snprintf(object->mbo_paxpath, MAXPATHLEN, "%s", argv[current+1]);
++			else
++				memset(object->mbo_paxpath, 0x00, MAXPATHLEN);
+ 			current += 2;
+ 		} else if (strcmp(argv[current], "suid") == 0) {
+ 			flags |= MBO_SUID;
+@@ -991,12 +1067,54 @@ bsde_parse_mode(int argc, char *argv[], mode_t *mode, size_t buflen,
+ }
+ 
+ int
++bsde_parse_paxflags(int argc, char *argv[], uint32_t *pax, size_t buflen, char *errstr)
++{
++	size_t len;
++	int i;
++
++	if (argc == 0) {
++		len = snprintf(errstr, buflen, "paxflags expects mode value");
++		return (-1);
++	}
++
++	if (argc != 1) {
++		len = snprintf(errstr, buflen, "'%s' unexpected", argv[1]);
++		return (-1);
++	}
++
++	*pax = 0;
++	for (i = 0; i < strlen(argv[0]); i++) {
++		switch (argv[0][i]) {
++		case 'A':
++			*pax |= MBI_FORCE_ASLR_ENABLED;
++			break;
++		case 'a':
++			*pax |= MBI_FORCE_ASLR_DISABLED;
++			break;
++		case 'S':
++			*pax |= MBI_FORCE_SEGVGUARD_ENABLED;
++			break;
++		case 's':
++			*pax |= MBI_FORCE_SEGVGUARD_DISABLED;
++			break;
++		default:
++			len = snprintf(errstr, buflen, "Unknown mode letter: %c",
++					argv[0][i]);
++			return (-1);
++		} 
++	}
++
++	return (0);
++}
++
++int
+ bsde_parse_rule(int argc, char *argv[], struct mac_bsdextended_rule *rule,
+     size_t buflen, char *errstr)
+ {
+ 	int subject, subject_elements, subject_elements_length;
+ 	int object, object_elements, object_elements_length;
+ 	int mode, mode_elements, mode_elements_length;
++	int paxflags, paxflags_elements, paxflags_elements_length=0;
+ 	int error, i;
+ 	size_t len;
+ 
+@@ -1037,11 +1155,22 @@ bsde_parse_rule(int argc, char *argv[], struct mac_bsdextended_rule *rule,
+ 		return (-1);
+ 	}
+ 
++	/* Search forward for paxflags */
++	paxflags = -1;
++	for (i = 1; i < argc; i++)
++		if (strcmp(argv[i], "paxflags") == 0)
++			paxflags = i;
++
++	if (paxflags >= 0) {
++		paxflags_elements = paxflags + 1;
++		paxflags_elements_length = argc - paxflags_elements;
++	}
++
+ 	subject_elements_length = object - subject - 1;
+ 	object_elements = object + 1;
+ 	object_elements_length = mode - object_elements;
+ 	mode_elements = mode + 1;
+-	mode_elements_length = argc - mode_elements;
++	mode_elements_length = argc - mode_elements - (paxflags_elements_length ? paxflags_elements_length+1 : 0);
+ 
+ 	error = bsde_parse_subject(subject_elements_length,
+ 	    argv + subject_elements, &rule->mbr_subject, buflen, errstr);
+@@ -1058,6 +1187,13 @@ bsde_parse_rule(int argc, char *argv[], struct mac_bsdextended_rule *rule,
+ 	if (error)
+ 		return (-1);
+ 
++	if (paxflags >= 0) {
++		error = bsde_parse_paxflags(paxflags_elements_length, argv + paxflags_elements,
++				&rule->mbr_pax, buflen, errstr);
++		if (error)
++			return (-1);
++	}
++
+ 	return (0);
+ }
+ 
+diff --git a/lib/libugidfw/ugidfw.h b/lib/libugidfw/ugidfw.h
+index 5b7fcf2..cef469c 100644
+--- a/lib/libugidfw/ugidfw.h
++++ b/lib/libugidfw/ugidfw.h
+@@ -39,6 +39,8 @@ int	bsde_rule_to_string(struct mac_bsdextended_rule *rule, char *buf,
+ 	    size_t buflen);
+ int	bsde_parse_mode(int argc, char *argv[], mode_t *mode, size_t buflen,
+ 	    char *errstr);
++int	bsde_parse_paxflags(int argc, char *argv[], uint32_t *pax, size_t buflen,
++	    char *errstr);
+ int	bsde_parse_rule(int argc, char *argv[],
+ 	    struct mac_bsdextended_rule *rule, size_t buflen, char *errstr);
+ int	bsde_parse_rule_string(const char *string,
+diff --git a/libexec/getty/Makefile b/libexec/getty/Makefile
+index f967958..797f73b 100644
+--- a/libexec/getty/Makefile
++++ b/libexec/getty/Makefile
+@@ -7,6 +7,8 @@ DPADD=	${LIBUTIL}
+ LDADD=	-lutil
+ MAN=	gettytab.5 ttys.5 getty.8
+ 
++CAN_PIE=1
++
+ WARNS?=	1
+ WFORMAT=0
+ 
+diff --git a/libexec/rtld-elf/rtld.c b/libexec/rtld-elf/rtld.c
+index 443767d..ed732ae 100644
+--- a/libexec/rtld-elf/rtld.c
++++ b/libexec/rtld-elf/rtld.c
+@@ -864,7 +864,7 @@ digest_dynamic1(Obj_Entry *obj, int early, const Elf_Dyn **dyn_rpath,
+     const Elf_Hashelt *hashtab;
+     const Elf32_Word *hashval;
+     Elf32_Word bkt, nmaskwords;
+-    int bloom_size32;
++    unsigned int bloom_size32;
+     bool nmw_power2;
+     int plttype = DT_REL;
+ 
+diff --git a/release/Makefile b/release/Makefile
+index 92075f8..736d6d2 100644
+--- a/release/Makefile
++++ b/release/Makefile
+@@ -31,6 +31,7 @@ PORTSDIR?=	/usr/ports
+ DOCDIR?=	/usr/doc
+ RELNOTES_LANG?= en_US.ISO8859-1
+ XZCMD?=		/usr/bin/xz
++KERNCONF?=	GENERIC
+ 
+ .if !defined(TARGET) || empty(TARGET)
+ TARGET=		${MACHINE}
+@@ -120,7 +121,8 @@ base.txz:
+ 
+ kernel.txz:
+ 	mkdir -p ${DISTDIR}
+-	cd ${WORLDDIR} && ${IMAKE} distributekernel packagekernel DISTDIR=${.OBJDIR}/${DISTDIR}
++	cd ${WORLDDIR} && ${IMAKE} distributekernel packagekernel \
++		DISTDIR=${.OBJDIR}/${DISTDIR} KERNCONF=${KERNCONF}
+ 	mv ${DISTDIR}/kernel*.txz .
+ 
+ src.txz:
+@@ -152,7 +154,8 @@ system: packagesystem
+ 	mkdir -p release
+ 	cd ${WORLDDIR} && ${IMAKE} installkernel installworld distribution \
+ 		DESTDIR=${.OBJDIR}/release WITHOUT_RESCUE=1 WITHOUT_KERNEL_SYMBOLS=1 \
+-		WITHOUT_PROFILE=1 WITHOUT_SENDMAIL=1 WITHOUT_ATF=1 WITHOUT_LIB32=1
++		WITHOUT_PROFILE=1 WITHOUT_SENDMAIL=1 WITHOUT_ATF=1 WITHOUT_LIB32=1 \
++		KERNCONF=${KERNCONF}
+ # Copy distfiles
+ 	mkdir -p release/usr/freebsd-dist
+ 	cp *.txz MANIFEST release/usr/freebsd-dist
+@@ -177,7 +180,7 @@ bootonly: packagesystem
+ 	    WITHOUT_INSTALLLIB=1 WITHOUT_LIB32=1 WITHOUT_MAIL=1 \
+ 	    WITHOUT_NCP=1 WITHOUT_TOOLCHAIN=1 WITHOUT_PROFILE=1 \
+ 	    WITHOUT_INSTALLIB=1 WITHOUT_RESCUE=1 WITHOUT_DICT=1 \
+-	    WITHOUT_KERNEL_SYMBOLS=1
++	    WITHOUT_KERNEL_SYMBOLS=1 KERNCONF=${KERNCONF}
+ # Copy manifest only (no distfiles) to get checksums
+ 	mkdir -p bootonly/usr/freebsd-dist
+ 	cp MANIFEST bootonly/usr/freebsd-dist
+@@ -196,7 +199,8 @@ dvd:
+ # Install system
+ 	mkdir -p ${.TARGET}
+ 	cd ${WORLDDIR} && ${IMAKE} installkernel installworld distribution \
+-		DESTDIR=${.OBJDIR}/${.TARGET} WITHOUT_RESCUE=1 WITHOUT_KERNEL_SYMBOLS=1
++		DESTDIR=${.OBJDIR}/${.TARGET} WITHOUT_RESCUE=1 WITHOUT_KERNEL_SYMBOLS=1 \
++		KERNCONF=${KERNCONF}
+ # Copy distfiles
+ 	mkdir -p ${.TARGET}/usr/freebsd-dist
+ 	cp *.txz MANIFEST ${.TARGET}/usr/freebsd-dist
+diff --git a/sbin/casperd/Makefile b/sbin/casperd/Makefile
+index f5a8e05..79d7afb 100644
+--- a/sbin/casperd/Makefile
++++ b/sbin/casperd/Makefile
+@@ -7,6 +7,8 @@ SRCS=	casperd.c zygote.c
+ DPADD=	${LIBCASPER} ${LIBCAPSICUM} ${LIBNV} ${LIBPJDLOG} ${LIBUTIL}
+ LDADD=	-lcasper -lcapsicum -lnv -lpjdlog -lutil
+ 
++CAN_PIE=	1
++
+ MAN=	casperd.8
+ 
+ CFLAGS+=-I${.CURDIR}
+diff --git a/sbin/dhclient/Makefile b/sbin/dhclient/Makefile
+index 09f19db..fef5928 100644
+--- a/sbin/dhclient/Makefile
++++ b/sbin/dhclient/Makefile
+@@ -44,6 +44,8 @@ MAN=	dhclient.8 dhclient.conf.5 dhclient.leases.5 dhcp-options.5 \
+ DPADD=	${LIBUTIL}
+ LDADD=	-lutil
+ 
++CAN_PIE=1
++
+ WARNS?=	2
+ 
+ .if ${MK_TESTS} != "no"
+diff --git a/sbin/hastd/Makefile b/sbin/hastd/Makefile
+index 306c83a..44b6a94 100644
+--- a/sbin/hastd/Makefile
++++ b/sbin/hastd/Makefile
+@@ -19,6 +19,8 @@ SRCS+=	token.l
+ SRCS+=	y.tab.h
+ MAN=	hastd.8 hast.conf.5
+ 
++CAN_PIE=1
++
+ NO_WFORMAT=
+ NO_WCAST_ALIGN=
+ NO_WMISSING_VARIABLE_DECLARATIONS=
+diff --git a/sbin/natd/Makefile b/sbin/natd/Makefile
+index 7d8b3e4..fdb3483 100644
+--- a/sbin/natd/Makefile
++++ b/sbin/natd/Makefile
+@@ -7,4 +7,6 @@ LDADD		= -lalias
+ DPADD		= ${LIBALIAS}
+ MAN		= natd.8
+ 
++CAN_PIE=1
++
+ .include <bsd.prog.mk>
+diff --git a/sbin/nfsiod/Makefile b/sbin/nfsiod/Makefile
+index 47cd290..14d4c13 100644
+--- a/sbin/nfsiod/Makefile
++++ b/sbin/nfsiod/Makefile
+@@ -4,4 +4,6 @@
+ PROG=	nfsiod
+ MAN=	nfsiod.8
+ 
++CAN_PIE=1
++
+ .include <bsd.prog.mk>
+diff --git a/sbin/rtsol/Makefile b/sbin/rtsol/Makefile
+index d738008..7210024 100644
+--- a/sbin/rtsol/Makefile
++++ b/sbin/rtsol/Makefile
+@@ -22,6 +22,8 @@ PROG=	rtsol
+ SRCS=	rtsold.c rtsol.c if.c probe.c dump.c rtsock.c
+ MAN=
+ 
++CAN_PIE=1
++
+ WARNS?=	3
+ CFLAGS+= -DHAVE_ARC4RANDOM -DHAVE_POLL_H -DSMALL
+ 
+diff --git a/secure/usr.sbin/sshd/Makefile b/secure/usr.sbin/sshd/Makefile
+index d487fe3..93fff92 100644
+--- a/secure/usr.sbin/sshd/Makefile
++++ b/secure/usr.sbin/sshd/Makefile
+@@ -22,6 +22,8 @@ SRCS=	sshd.c auth-rhosts.c auth-passwd.c auth-rsa.c auth-rh-rsa.c \
+ # gss-genr.c really belongs in libssh; see src/secure/lib/libssh/Makefile
+ SRCS+=	gss-genr.c
+ 
++CAN_PIE=1
++
+ MAN=	sshd.8 sshd_config.5
+ CFLAGS+=-I${SSHDIR} -include ssh_namespace.h
+ 
+diff --git a/share/mk/bsd.prog.mk b/share/mk/bsd.prog.mk
+index 06867eb..c65c0f3 100644
+--- a/share/mk/bsd.prog.mk
++++ b/share/mk/bsd.prog.mk
+@@ -11,6 +11,16 @@
+ CFLAGS+=${COPTS}
+ .endif
+ 
++.if ${MK_PIE} != "no" && defined(CAN_PIE)
++.if !defined(RESCUE) && !defined(NO_SHARED)
++CFLAGS+= -fPIE -pie
++.elif defined(NO_SHARED)
++.if ${NO_SHARED} == "no" || ${NO_SHARED} == "NO"
++CFLAGS+= -fPIE -pie
++.endif
++.endif
++.endif
++
+ .if ${MK_ASSERT_DEBUG} == "no"
+ CFLAGS+= -DNDEBUG
+ NO_WERROR=
+diff --git a/share/mk/src.opts.mk b/share/mk/src.opts.mk
+index f82167b8..4949f10 100644
+--- a/share/mk/src.opts.mk
++++ b/share/mk/src.opts.mk
+@@ -175,6 +175,7 @@ __DEFAULT_NO_OPTIONS = \
+     OFED \
+     OPENLDAP \
+     OPENSSH_NONE_CIPHER \
++    PIE \
+     SHARED_TOOLCHAIN \
+     SORT_THREADS \
+     SVN \
+diff --git a/sys/amd64/amd64/elf_machdep.c b/sys/amd64/amd64/elf_machdep.c
+index fdc4d56..ffb5e31 100644
+--- a/sys/amd64/amd64/elf_machdep.c
++++ b/sys/amd64/amd64/elf_machdep.c
+@@ -26,12 +26,17 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+ #include <sys/exec.h>
+ #include <sys/imgact.h>
+ #include <sys/linker.h>
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
+ #include <sys/proc.h>
+ #include <sys/sysent.h>
+ #include <sys/imgact_elf.h>
+@@ -81,6 +86,11 @@ struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_shared_page_base = SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf64_sysvec, &elf64_freebsd_sysvec);
+ 
+diff --git a/sys/amd64/conf/LATT-ASLR b/sys/amd64/conf/LATT-ASLR
+new file mode 100644
+index 0000000..4e9e3a0
+--- /dev/null
++++ b/sys/amd64/conf/LATT-ASLR
+@@ -0,0 +1,7 @@
++include GENERIC
++
++options PAX_ASLR
++options PAX_SEGVGUARD
++
++options VIMAGE
++options GEOM_PART_VTOC8
+diff --git a/sys/amd64/conf/OP-ASLR b/sys/amd64/conf/OP-ASLR
+new file mode 100644
+index 0000000..cc6de36
+--- /dev/null
++++ b/sys/amd64/conf/OP-ASLR
+@@ -0,0 +1,388 @@
++#
++# GENERIC -- Generic kernel configuration file for FreeBSD/amd64
++#
++# For more information on this file, please read the config(5) manual page,
++# and/or the handbook section on Kernel Configuration Files:
++#
++#    http://www.FreeBSD.org/doc/en_US.ISO8859-1/books/handbook/kernelconfig-config.html
++#
++# The handbook is also available locally in /usr/share/doc/handbook
++# if you've installed the doc distribution, otherwise always see the
++# FreeBSD World Wide Web server (http://www.FreeBSD.org/) for the
++# latest information.
++#
++# An exhaustive list of options and more detailed explanations of the
++# device lines is also present in the ../../conf/NOTES and NOTES files.
++# If you are in doubt as to the purpose or necessity of a line, check first
++# in NOTES.
++#
++# $FreeBSD$
++
++cpu		HAMMER
++ident		OP-PERPETUA
++
++options		HZ=100
++
++makeoptions	DEBUG=-gdwarf-2		# Build kernel with gdb(1) debug symbols
++makeoptions	MODULES_OVERRIDE="geom/geom_sched linux"
++#makeoptions	WITH_CTF=1		# Run ctfconvert(1) for DTrace support
++
++options 	SCHED_ULE		# ULE scheduler
++#options 	PREEMPTION		# Enable kernel thread preemption
++options 	INET			# InterNETworking
++options 	INET6			# IPv6 communications protocols
++options 	TCP_OFFLOAD		# TCP offload
++#options 	SCTP			# Stream Control Transmission Protocol
++options 	FFS			# Berkeley Fast Filesystem
++options 	SOFTUPDATES		# Enable FFS soft updates support
++options 	UFS_ACL			# Support for access control lists
++options 	UFS_DIRHASH		# Improve performance on big directories
++options		UFS_EXTATTR
++#options 	UFS_GJOURNAL		# Enable gjournal-based UFS journaling
++options 	QUOTA			# Enable disk quotas for UFS
++#options 	MD_ROOT			# MD is a potential root device
++#options 	NFSCL			# New Network Filesystem Client
++#options 	NFSD			# New Network Filesystem Server
++#options 	NFSLOCKD		# Network Lock Manager
++#options 	NFS_ROOT		# NFS usable as /, requires NFSCL
++#options 	MSDOSFS			# MSDOS Filesystem
++#options 	CD9660			# ISO 9660 Filesystem
++#options 	PROCFS			# Process filesystem (requires PSEUDOFS)
++options 	PSEUDOFS		# Pseudo-filesystem framework
++options 	GEOM_PART_GPT		# GUID Partition Tables.
++options 	GEOM_RAID		# Soft RAID functionality.
++options 	GEOM_LABEL		# Provides labelization
++options 	COMPAT_FREEBSD32	# Compatible with i386 binaries
++options 	COMPAT_FREEBSD4		# Compatible with FreeBSD4
++options 	COMPAT_FREEBSD5		# Compatible with FreeBSD5
++options 	COMPAT_FREEBSD6		# Compatible with FreeBSD6
++options 	COMPAT_FREEBSD7		# Compatible with FreeBSD7
++options 	SCSI_DELAY=5000		# Delay (in ms) before probing SCSI
++options 	KTRACE			# ktrace(1) support
++options 	STACK			# stack(9) support
++options 	SYSVSHM			# SYSV-style shared memory
++options 	SYSVMSG			# SYSV-style message queues
++options 	SYSVSEM			# SYSV-style semaphores
++options 	_KPOSIX_PRIORITY_SCHEDULING # POSIX P1003_1B real-time extensions
++options 	PRINTF_BUFR_SIZE=128	# Prevent printf output being interspersed.
++options 	KBD_INSTALL_CDEV	# install a CDEV entry in /dev
++options 	HWPMC_HOOKS		# Necessary kernel hooks for hwpmc(4)
++options 	AUDIT			# Security event auditing
++options 	CAPABILITY_MODE		# Capsicum capability mode
++options 	CAPABILITIES		# Capsicum capabilities
++options 	PROCDESC		# Support for process descriptors
++options 	MAC			# TrustedBSD MAC Framework
++#options 	KDTRACE_FRAME		# Ensure frames are compiled in
++#options 	KDTRACE_HOOKS		# Kernel DTrace hooks
++#options 	DDB_CTF			# Kernel ELF linker loads CTF data
++options 	INCLUDE_CONFIG_FILE     # Include this file in kernel
++
++# Debugging support.  Always need this:
++options 	KDB			# Enable kernel debugger support.
++options 	KDB_TRACE		# Print a stack trace for a panic.
++options		DDB			# Support DDB.
++
++# Make an SMP-capable kernel by default
++options 	SMP			# Symmetric MultiProcessor Kernel
++
++# CPU frequency control
++device		cpufreq
++
++# Bus support.
++device		acpi
++device		pci
++
++# Floppy drives
++#device		fdc
++
++# ATA controllers
++device		ahci		# AHCI-compatible SATA controllers
++#device		ata		# Legacy ATA/SATA controllers
++#options 	ATA_STATIC_ID	# Static device numbering
++#device		mvs		# Marvell 88SX50XX/88SX60XX/88SX70XX/SoC SATA
++#device		siis		# SiliconImage SiI3124/SiI3132/SiI3531 SATA
++
++# SCSI Controllers
++#device		ahc		# AHA2940 and onboard AIC7xxx devices
++#options 	AHC_REG_PRETTY_PRINT	# Print register bitfields in debug
++#					# output.  Adds ~128k to driver.
++#device		ahd		# AHA39320/29320 and onboard AIC79xx devices
++#options 	AHD_REG_PRETTY_PRINT	# Print register bitfields in debug
++#					# output.  Adds ~215k to driver.
++#device		esp		# AMD Am53C974 (Tekram DC-390(T))
++#device		hptiop		# Highpoint RocketRaid 3xxx series
++#device		isp		# Qlogic family
++#device		ispfw		# Firmware for QLogic HBAs- normally a module
++#device		mpt		# LSI-Logic MPT-Fusion
++#device		mps		# LSI-Logic MPT-Fusion 2
++#device		ncr		# NCR/Symbios Logic
++#device		sym		# NCR/Symbios Logic (newer chipsets + those of `ncr')
++#device		trm		# Tekram DC395U/UW/F DC315U adapters
++
++#device		adv		# Advansys SCSI adapters
++#device		adw		# Advansys wide SCSI adapters
++#device		aic		# Adaptec 15[012]x SCSI adapters, AIC-6[23]60.
++#device		bt		# Buslogic/Mylex MultiMaster SCSI adapters
++#device		isci		# Intel C600 SAS controller
++
++# ATA/SCSI peripherals
++device		scbus		# SCSI bus (required for ATA/SCSI)
++#device		ch		# SCSI media changers
++device		da		# Direct Access (disks)
++#device		sa		# Sequential Access (tape etc)
++#device		cd		# CD
++device		pass		# Passthrough device (direct ATA/SCSI access)
++device		ses		# Enclosure Services (SES and SAF-TE)
++#device		ctl		# CAM Target Layer
++
++# RAID controllers interfaced to the SCSI subsystem
++#device		amr		# AMI MegaRAID
++#device		arcmsr		# Areca SATA II RAID
++#XXX it is not 64-bit clean, -scottl
++#device		asr		# DPT SmartRAID V, VI and Adaptec SCSI RAID
++#device		ciss		# Compaq Smart RAID 5*
++#device		dpt		# DPT Smartcache III, IV - See NOTES for options
++#device		hptmv		# Highpoint RocketRAID 182x
++#device		hptnr		# Highpoint DC7280, R750
++#device		hptrr		# Highpoint RocketRAID 17xx, 22xx, 23xx, 25xx
++#device		hpt27xx		# Highpoint RocketRAID 27xx
++#device		iir		# Intel Integrated RAID
++#device		ips		# IBM (Adaptec) ServeRAID
++#device		mly		# Mylex AcceleRAID/eXtremeRAID
++#device		twa		# 3ware 9000 series PATA/SATA RAID
++#device		tws		# LSI 3ware 9750 SATA+SAS 6Gb/s RAID controller
++
++# RAID controllers
++#device		aac		# Adaptec FSA RAID
++#device		aacp		# SCSI passthrough for aac (requires CAM)
++#device		aacraid		# Adaptec by PMC RAID
++#device		ida		# Compaq Smart RAID
++#device		mfi		# LSI MegaRAID SAS
++#device		mlx		# Mylex DAC960 family
++#XXX pointer/int warnings
++#device		pst		# Promise Supertrak SX6000
++#device		twe		# 3ware ATA RAID
++
++# atkbdc0 controls both the keyboard and the PS/2 mouse
++device		atkbdc		# AT keyboard controller
++device		atkbd		# AT keyboard
++device		psm		# PS/2 mouse
++
++device		kbdmux		# keyboard multiplexer
++
++device		vga		# VGA video card driver
++options 	VESA		# Add support for VESA BIOS Extensions (VBE)
++
++#device		splash		# Splash screen and screen saver support
++
++# syscons is the default console driver, resembling an SCO console
++device		sc
++options 	SC_PIXEL_MODE	# add support for the raster text mode
++
++device		agp		# support several AGP chipsets
++
++# PCCARD (PCMCIA) support
++# PCMCIA and cardbus bridge support
++#device		cbb		# cardbus (yenta) bridge
++#device		pccard		# PC Card (16-bit) bus
++#device		cardbus		# CardBus (32-bit) bus
++
++# Serial (COM) ports
++device		uart		# Generic UART driver
++
++# Parallel port
++#device		ppc
++#device		ppbus		# Parallel port bus (required)
++#device		lpt		# Printer
++#device		ppi		# Parallel port interface device
++#device		vpo		# Requires scbus and da
++
++#device		puc		# Multi I/O cards and multi-channel UARTs
++
++# PCI Ethernet NICs.
++#device		bxe		# Broadcom NetXtreme II BCM5771X/BCM578XX 10GbE
++#device		de		# DEC/Intel DC21x4x (``Tulip'')
++device		em		# Intel PRO/1000 Gigabit Ethernet Family
++#device		igb		# Intel PRO/1000 PCIE Server Gigabit Family
++#device		ixgbe		# Intel PRO/10GbE PCIE Ethernet Family
++#device		le		# AMD Am7900 LANCE and Am79C9xx PCnet
++#device		ti		# Alteon Networks Tigon I/II gigabit Ethernet
++#device		txp		# 3Com 3cR990 (``Typhoon'')
++#device		vx		# 3Com 3c590, 3c595 (``Vortex'')
++
++# PCI Ethernet NICs that use the common MII bus controller code.
++# NOTE: Be sure to keep the 'device miibus' line in order to use these NICs!
++device		miibus		# MII bus support
++#device		ae		# Attansic/Atheros L2 FastEthernet
++#device		age		# Attansic/Atheros L1 Gigabit Ethernet
++#device		alc		# Atheros AR8131/AR8132 Ethernet
++#device		ale		# Atheros AR8121/AR8113/AR8114 Ethernet
++#device		bce		# Broadcom BCM5706/BCM5708 Gigabit Ethernet
++#device		bfe		# Broadcom BCM440x 10/100 Ethernet
++#device		bge		# Broadcom BCM570xx Gigabit Ethernet
++#device		cas		# Sun Cassini/Cassini+ and NS DP83065 Saturn
++#device		dc		# DEC/Intel 21143 and various workalikes
++#device		et		# Agere ET1310 10/100/Gigabit Ethernet
++#device		fxp		# Intel EtherExpress PRO/100B (82557, 82558)
++#device		gem		# Sun GEM/Sun ERI/Apple GMAC
++#device		hme		# Sun HME (Happy Meal Ethernet)
++#device		jme		# JMicron JMC250 Gigabit/JMC260 Fast Ethernet
++#device		lge		# Level 1 LXT1001 gigabit Ethernet
++device		msk		# Marvell/SysKonnect Yukon II Gigabit Ethernet
++#device		nfe		# nVidia nForce MCP on-board Ethernet
++#device		nge		# NatSemi DP83820 gigabit Ethernet
++#device		nve		# nVidia nForce MCP on-board Ethernet Networking
++#device		pcn		# AMD Am79C97x PCI 10/100 (precedence over 'le')
++#device		re		# RealTek 8139C+/8169/8169S/8110S
++#device		rl		# RealTek 8129/8139
++#device		sf		# Adaptec AIC-6915 (``Starfire'')
++#device		sge		# Silicon Integrated Systems SiS190/191
++#device		sis		# Silicon Integrated Systems SiS 900/SiS 7016
++device		sk		# SysKonnect SK-984x & SK-982x gigabit Ethernet
++#device		ste		# Sundance ST201 (D-Link DFE-550TX)
++#device		stge		# Sundance/Tamarack TC9021 gigabit Ethernet
++#device		tl		# Texas Instruments ThunderLAN
++#device		tx		# SMC EtherPower II (83c170 ``EPIC'')
++#device		vge		# VIA VT612x gigabit Ethernet
++#device		vr		# VIA Rhine, Rhine II
++#device		wb		# Winbond W89C840F
++#device		xl		# 3Com 3c90x (``Boomerang'', ``Cyclone'')
++
++# ISA Ethernet NICs.  pccard NICs included.
++#device		cs		# Crystal Semiconductor CS89x0 NIC
++# 'device ed' requires 'device miibus'
++#device		ed		# NE[12]000, SMC Ultra, 3c503, DS8390 cards
++#device		ex		# Intel EtherExpress Pro/10 and Pro/10+
++#device		ep		# Etherlink III based cards
++#device		fe		# Fujitsu MB8696x based cards
++#device		sn		# SMC's 9000 series of Ethernet chips
++#device		xe		# Xircom pccard Ethernet
++
++# Wireless NIC cards
++device		wlan		# 802.11 support
++options 	IEEE80211_DEBUG	# enable debug msgs
++options 	IEEE80211_AMPDU_AGE # age frames in AMPDU reorder q's
++options 	IEEE80211_SUPPORT_MESH	# enable 802.11s draft support
++device		wlan_wep	# 802.11 WEP support
++device		wlan_ccmp	# 802.11 CCMP support
++device		wlan_tkip	# 802.11 TKIP support
++device		wlan_amrr	# AMRR transmit rate control algorithm
++#device		an		# Aironet 4500/4800 802.11 wireless NICs.
++#device		ath		# Atheros NICs
++#device		ath_pci		# Atheros pci/cardbus glue
++#device		ath_hal		# pci/cardbus chip support
++#options 	AH_SUPPORT_AR5416	# enable AR5416 tx/rx descriptors
++#options 	AH_AR5416_INTERRUPT_MITIGATION	# AR5416 interrupt mitigation
++#options 	ATH_ENABLE_11N	# Enable 802.11n support for AR5416 and later
++#device		ath_rate_sample	# SampleRate tx rate control for ath
++#device		bwi		# Broadcom BCM430x/BCM431x wireless NICs.
++#device		bwn		# Broadcom BCM43xx wireless NICs.
++#device		ipw		# Intel 2100 wireless NICs.
++#device		iwi		# Intel 2200BG/2225BG/2915ABG wireless NICs.
++device		iwn		# Intel 4965/1000/5000/6000 wireless NICs.
++#device		malo		# Marvell Libertas wireless NICs.
++#device		mwl		# Marvell 88W8363 802.11n wireless NICs.
++#device		ral		# Ralink Technology RT2500 wireless NICs.
++#device		wi		# WaveLAN/Intersil/Symbol 802.11 wireless NICs.
++#device		wpi		# Intel 3945ABG wireless NICs.
++
++# Pseudo devices.
++device		loop		# Network loopback
++device		random		# Entropy device
++#device		padlock_rng	# VIA Padlock RNG
++device		rdrand_rng	# Intel Bull Mountain RNG
++device		ether		# Ethernet support
++device		vlan		# 802.1Q VLAN support
++device		tun		# Packet tunnel.
++device		md		# Memory "disks"
++device		gif		# IPv6 and IPv4 tunneling
++device		faith		# IPv6-to-IPv4 relaying (translation)
++device		firmware	# firmware assist module
++
++# The `bpf' device enables the Berkeley Packet Filter.
++# Be aware of the administrative consequences of enabling this!
++# Note that 'bpf' is required for DHCP.
++device		bpf		# Berkeley packet filter
++
++# USB support
++options 	USB_DEBUG	# enable debug msgs
++device		uhci		# UHCI PCI->USB interface
++device		ohci		# OHCI PCI->USB interface
++device		ehci		# EHCI PCI->USB interface (USB 2.0)
++device		xhci		# XHCI PCI->USB interface (USB 3.0)
++device		usb		# USB Bus (required)
++device		ukbd		# Keyboard
++device		ums		# Mouse
++#device		umass		# Disks/Mass storage - Requires scbus and da
++
++# Sound support
++device		sound		# Generic sound driver (required)
++#device		snd_cmi		# CMedia CMI8338/CMI8738
++#device		snd_csa		# Crystal Semiconductor CS461x/428x
++#device		snd_emu10kx	# Creative SoundBlaster Live! and Audigy
++#device		snd_es137x	# Ensoniq AudioPCI ES137x
++device		snd_hda		# Intel High Definition Audio
++#device		snd_ich		# Intel, NVidia and other ICH AC'97 Audio
++#device		snd_via8233	# VIA VT8233x Audio
++
++# MMC/SD
++#device		mmc		# MMC/SD bus
++#device		mmcsd		# MMC/SD memory card
++#device		sdhci		# Generic PCI SD Host Controller
++
++# VirtIO support
++#device		virtio		# Generic VirtIO bus (required)
++#device		virtio_pci	# VirtIO PCI device
++#device		vtnet		# VirtIO Ethernet device
++#device		virtio_blk	# VirtIO Block device
++#device		virtio_scsi	# VirtIO SCSI device
++#device		virtio_balloon	# VirtIO Memory Balloon device
++
++# HyperV drivers
++#device		hyperv		# HyperV drivers 
++
++# Xen HVM Guest Optimizations
++# NOTE: XENHVM depends on xenpci.  They must be added or removed together.
++#options 	XENHVM		# Xen HVM kernel infrastructure
++#device		xenpci		# Xen HVM Hypervisor services driver
++
++# VMware support
++#device		vmx		# VMware VMXNET3 Ethernet
++
++# hw
++device		coretemp
++device		cpuctl
++
++# sc related
++options		SC_DISABLE_REBOOT
++
++# ukbd
++options		UKBD_DFLT_KEYMAP
++makeoptions	UKBD_DFLT_KEYMAP=us.pc-ctrl
++
++# ipfw
++options		IPFIREWALL
++options		IPFIREWALL_VERBOSE
++options		IPFIREWALL_VERBOSE_LIMIT=100
++options		IPSTEALTH
++
++# crypto
++device		crypto			# core crypto support
++device		cryptodev		# /dev/crypto for access to h/w
++device		aesni
++
++# sec
++options		MALLOC_DEBUG_MAXZONES=8	# Separate malloc(9) zones
++
++options 	DEADLKRES               # Enable the deadlock resolver
++options 	INVARIANTS              # Enable calls of extra sanity c
++options 	INVARIANT_SUPPORT       # Extra sanity checks of interna
++options 	WITNESS                 # Enable checks to detect deadlo
++options 	WITNESS_SKIPSPIN        # Don't run witness on spinlocks
++
++options 	ALT_BREAK_TO_DEBUGGER
++options 	BREAK_TO_DEBUGGER
++
++options		PAX_ASLR
++options		PAX_SEGVGUARD
++options		MAC_BSDEXTENDED
+diff --git a/sys/amd64/include/vmparam.h b/sys/amd64/include/vmparam.h
+index bda9722..5e83a8f 100644
+--- a/sys/amd64/include/vmparam.h
++++ b/sys/amd64/include/vmparam.h
+@@ -170,7 +170,7 @@
+ #define	VM_MAXUSER_ADDRESS	UVADDR(NUPML4E, 0, 0, 0)
+ 
+ #define	SHAREDPAGE		(VM_MAXUSER_ADDRESS - PAGE_SIZE)
+-#define	USRSTACK		SHAREDPAGE
++#define	USRSTACK		(SHAREDPAGE - 4*PAGE_SIZE)
+ 
+ #define	VM_MAX_ADDRESS		UPT_MAX_ADDRESS
+ #define	VM_MIN_ADDRESS		(0)
+diff --git a/sys/amd64/linux32/linux32_sysvec.c b/sys/amd64/linux32/linux32_sysvec.c
+index c06ce11..f4f99f58 100644
+--- a/sys/amd64/linux32/linux32_sysvec.c
++++ b/sys/amd64/linux32/linux32_sysvec.c
+@@ -33,6 +33,7 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ #include "opt_compat.h"
++#include "opt_pax.h"
+ 
+ #ifndef COMPAT_FREEBSD32
+ #error "Unable to compile Linux-emulator due to missing COMPAT_FREEBSD32 option!"
+@@ -84,6 +85,10 @@ __FBSDID("$FreeBSD$");
+ #include <compat/linux/linux_signal.h>
+ #include <compat/linux/linux_util.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ MODULE_VERSION(linux, 1);
+ 
+ MALLOC_DEFINE(M_LINUX, "linux", "Linux mode structures");
+@@ -1037,6 +1042,11 @@ struct sysentvec elf_linux_sysvec = {
+ 	.sv_shared_page_base = LINUX32_SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= linux_schedtail,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init32,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf_sysvec, &elf_linux_sysvec);
+ 
+diff --git a/sys/arm/arm/elf_machdep.c b/sys/arm/arm/elf_machdep.c
+index 8ef9bd4..26e37e6 100644
+--- a/sys/arm/arm/elf_machdep.c
++++ b/sys/arm/arm/elf_machdep.c
+@@ -26,6 +26,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -46,6 +48,10 @@ __FBSDID("$FreeBSD$");
+ #include <machine/elf.h>
+ #include <machine/md_var.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_size	= SYS_MAXSYSCALL,
+ 	.sv_table	= sysent,
+@@ -79,6 +85,11 @@ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ 
+ static Elf32_Brandinfo freebsd_brand_info = {
+diff --git a/sys/arm/conf/LATT-ASLR b/sys/arm/conf/LATT-ASLR
+new file mode 100644
+index 0000000..48ed593
+--- /dev/null
++++ b/sys/arm/conf/LATT-ASLR
+@@ -0,0 +1,5 @@
++include RPI-B
++
++options PAX_ASLR
++options PAX_SEGVGUARD
++options VIMAGE
+diff --git a/sys/compat/freebsd32/freebsd32_misc.c b/sys/compat/freebsd32/freebsd32_misc.c
+index 68e761b..0519e6d 100644
+--- a/sys/compat/freebsd32/freebsd32_misc.c
++++ b/sys/compat/freebsd32/freebsd32_misc.c
+@@ -30,6 +30,7 @@ __FBSDID("$FreeBSD$");
+ #include "opt_compat.h"
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_pax.h"
+ 
+ #define __ELF_WORD_SIZE 32
+ 
+@@ -113,6 +114,10 @@ __FBSDID("$FreeBSD$");
+ 
+ FEATURE(compat_freebsd_32bit, "Compatible with 32-bit FreeBSD");
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ #ifndef __mips__
+ CTASSERT(sizeof(struct timeval32) == 8);
+ CTASSERT(sizeof(struct timespec32) == 8);
+@@ -2861,6 +2866,9 @@ freebsd32_copyout_strings(struct image_params *imgp)
+ {
+ 	int argc, envc, i;
+ 	u_int32_t *vectp;
++#ifdef PAX_ASLR
++	uintptr_t orig_destp;
++#endif
+ 	char *stringp;
+ 	uintptr_t destp;
+ 	u_int32_t *stack_base;
+@@ -2886,6 +2894,11 @@ freebsd32_copyout_strings(struct image_params *imgp)
+ 		szsigcode = 0;
+ 	destp =	(uintptr_t)arginfo;
+ 
++#ifdef PAX_ASLR
++	orig_destp = destp;
++	pax_aslr_stack(curthread, &destp, orig_destp);
++#endif
++
+ 	/*
+ 	 * install sigcode
+ 	 */
+diff --git a/sys/compat/ia32/ia32_sysvec.c b/sys/compat/ia32/ia32_sysvec.c
+index a8e52e8..ade8da5 100644
+--- a/sys/compat/ia32/ia32_sysvec.c
++++ b/sys/compat/ia32/ia32_sysvec.c
+@@ -29,6 +29,7 @@
+ __FBSDID("$FreeBSD$");
+ 
+ #include "opt_compat.h"
++#include "opt_pax.h"
+ 
+ #define __ELF_WORD_SIZE 32
+ 
+@@ -74,6 +75,10 @@ __FBSDID("$FreeBSD$");
+ #include <machine/pcb.h>
+ #include <machine/cpufunc.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ CTASSERT(sizeof(struct ia32_mcontext) == 640);
+ CTASSERT(sizeof(struct ia32_ucontext) == 704);
+ CTASSERT(sizeof(struct ia32_sigframe) == 800);
+@@ -139,6 +144,11 @@ struct sysentvec ia32_freebsd_sysvec = {
+ 	.sv_shared_page_base = FREEBSD32_SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init32,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf_ia32_sysvec, &ia32_freebsd_sysvec);
+ 
+diff --git a/sys/conf/files b/sys/conf/files
+index d11faa9..52ed99a 100644
+--- a/sys/conf/files
++++ b/sys/conf/files
+@@ -2880,6 +2880,9 @@ kern/kern_mtxpool.c		standard
+ kern/kern_mutex.c		standard
+ kern/kern_ntptime.c		standard
+ kern/kern_osd.c			standard
++kern/kern_pax.c			optional pax_aslr | pax_segvguard
++kern/kern_pax_aslr.c		optional pax_aslr
++kern/kern_pax_segvguard.c	optional pax_segvguard
+ kern/kern_physio.c		standard
+ kern/kern_pmc.c			standard
+ kern/kern_poll.c		optional device_polling
+diff --git a/sys/conf/options b/sys/conf/options
+index fdc3530..9e2dcd9 100644
+--- a/sys/conf/options
++++ b/sys/conf/options
+@@ -913,6 +913,12 @@ RACCT		opt_global.h
+ # Resource Limits
+ RCTL		opt_global.h
+ 
++# PaX - hardening options
++PAX_ASLR	opt_pax.h
++PAX_ASLR_MAX_SEC	opt_pax.h
++PAX_MPROTECT	opt_pax.h
++PAX_SEGVGUARD	opt_pax.h
++
+ # Random number generator(s)
+ RANDOM_YARROW	opt_random.h
+ RANDOM_FORTUNA	opt_random.h
+diff --git a/sys/i386/conf/LATT-ASLR b/sys/i386/conf/LATT-ASLR
+new file mode 100644
+index 0000000..4e9e3a0
+--- /dev/null
++++ b/sys/i386/conf/LATT-ASLR
+@@ -0,0 +1,7 @@
++include GENERIC
++
++options PAX_ASLR
++options PAX_SEGVGUARD
++
++options VIMAGE
++options GEOM_PART_VTOC8
+diff --git a/sys/i386/i386/elf_machdep.c b/sys/i386/i386/elf_machdep.c
+index 034b4c4..9571252 100644
+--- a/sys/i386/i386/elf_machdep.c
++++ b/sys/i386/i386/elf_machdep.c
+@@ -26,6 +26,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -46,6 +48,10 @@ __FBSDID("$FreeBSD$");
+ #include <machine/elf.h>
+ #include <machine/md_var.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_size	= SYS_MAXSYSCALL,
+ 	.sv_table	= sysent,
+@@ -81,6 +87,11 @@ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_shared_page_base = SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf32_sysvec, &elf32_freebsd_sysvec);
+ 
+diff --git a/sys/i386/ibcs2/ibcs2_sysvec.c b/sys/i386/ibcs2/ibcs2_sysvec.c
+index 5d007c7..1bb9d89 100644
+--- a/sys/i386/ibcs2/ibcs2_sysvec.c
++++ b/sys/i386/ibcs2/ibcs2_sysvec.c
+@@ -31,6 +31,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -50,6 +52,10 @@ __FBSDID("$FreeBSD$");
+ #include <i386/ibcs2/ibcs2_syscall.h>
+ #include <i386/ibcs2/ibcs2_signal.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ MODULE_VERSION(ibcs2, 1);
+ 
+ extern int bsd_to_ibcs2_errno[];
+@@ -89,6 +95,11 @@ struct sysentvec ibcs2_svr3_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = NULL,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init, /* XXXOP */
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ 
+ static int
+diff --git a/sys/i386/linux/linux_sysvec.c b/sys/i386/linux/linux_sysvec.c
+index 0ad6791..403070c 100644
+--- a/sys/i386/linux/linux_sysvec.c
++++ b/sys/i386/linux/linux_sysvec.c
+@@ -29,6 +29,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/exec.h>
+@@ -72,6 +74,10 @@ __FBSDID("$FreeBSD$");
+ #include <compat/linux/linux_signal.h>
+ #include <compat/linux/linux_util.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ MODULE_VERSION(linux, 1);
+ 
+ MALLOC_DEFINE(M_LINUX, "linux", "Linux mode structures");
+@@ -974,6 +980,11 @@ struct sysentvec linux_sysvec = {
+ 	.sv_shared_page_base = LINUX_SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= linux_schedtail,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init, /* XXXOP */
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(aout_sysvec, &linux_sysvec);
+ 
+@@ -1012,6 +1023,11 @@ struct sysentvec elf_linux_sysvec = {
+ 	.sv_shared_page_base = LINUX_SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= linux_schedtail,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf_sysvec, &elf_linux_sysvec);
+ 
+diff --git a/sys/ia64/ia64/elf_machdep.c b/sys/ia64/ia64/elf_machdep.c
+index 05cb641..e3d19c1 100644
+--- a/sys/ia64/ia64/elf_machdep.c
++++ b/sys/ia64/ia64/elf_machdep.c
+@@ -25,6 +25,8 @@
+  * $FreeBSD$
+  */
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -49,6 +51,10 @@
+ #include <machine/md_var.h>
+ #include <machine/unwind.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ Elf_Addr link_elf_get_gp(linker_file_t);
+ 
+ extern Elf_Addr fptr_storage[];
+@@ -86,6 +92,12 @@ struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
++
+ };
+ 
+ static Elf64_Brandinfo freebsd_brand_info = {
+diff --git a/sys/kern/imgact_aout.c b/sys/kern/imgact_aout.c
+index 3ae78de..aac03f1 100644
+--- a/sys/kern/imgact_aout.c
++++ b/sys/kern/imgact_aout.c
+@@ -27,6 +27,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/exec.h>
+ #include <sys/imgact.h>
+@@ -62,6 +64,10 @@ __FBSDID("$FreeBSD$");
+ #include <compat/ia32/ia32_signal.h>
+ #endif
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ static int	exec_aout_imgact(struct image_params *imgp);
+ static int	aout_fixup(register_t **stack_base, struct image_params *imgp);
+ 
+@@ -99,6 +105,11 @@ struct sysentvec aout_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init, /* XXXOP */
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ 
+ #elif defined(__amd64__)
+@@ -143,6 +154,11 @@ struct sysentvec aout_sysvec = {
+ 	.sv_set_syscall_retval = ia32_set_syscall_retval,
+ 	.sv_fetch_syscall_args = ia32_fetch_syscall_args,
+ 	.sv_syscallnames = freebsd32_syscallnames,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init32, /* XXXOP */
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ #else
+ #error "Port me"
+diff --git a/sys/kern/imgact_elf.c b/sys/kern/imgact_elf.c
+index 591094e..56020de 100644
+--- a/sys/kern/imgact_elf.c
++++ b/sys/kern/imgact_elf.c
+@@ -34,6 +34,7 @@ __FBSDID("$FreeBSD$");
+ #include "opt_capsicum.h"
+ #include "opt_compat.h"
+ #include "opt_core.h"
++#include "opt_pax.h"
+ 
+ #include <sys/param.h>
+ #include <sys/capsicum.h>
+@@ -48,6 +49,7 @@ __FBSDID("$FreeBSD$");
+ #include <sys/mman.h>
+ #include <sys/namei.h>
+ #include <sys/pioctl.h>
++#include <sys/jail.h>
+ #include <sys/proc.h>
+ #include <sys/procfs.h>
+ #include <sys/racct.h>
+@@ -81,6 +83,10 @@ __FBSDID("$FreeBSD$");
+ #include <machine/elf.h>
+ #include <machine/md_var.h>
+ 
++#if defined(PAX_ASLR) || defined(PAX_SEGVGUARD)
++#include <sys/pax.h>
++#endif
++
+ #define ELF_NOTE_ROUNDSIZE	4
+ #define OLD_EI_BRAND	8
+ 
+@@ -655,16 +661,16 @@ __elfN(load_file)(struct proc *p, const char *file, u_long *addr,
+ 	hdr = (const Elf_Ehdr *)imgp->image_header;
+ 	if ((error = __elfN(check_header)(hdr)) != 0)
+ 		goto fail;
+-	if (hdr->e_type == ET_DYN)
++	if (hdr->e_type == ET_DYN) {
+ 		rbase = *addr;
+-	else if (hdr->e_type == ET_EXEC)
++	} else if (hdr->e_type == ET_EXEC) {
+ 		rbase = 0;
+-	else {
++	} else {
+ 		error = ENOEXEC;
+ 		goto fail;
+ 	}
+ 
+-	/* Only support headers that fit within first page for now      */
++	/* Only support headers that fit within first page for now */
+ 	if ((hdr->e_phoff > PAGE_SIZE) ||
+ 	    (u_int)hdr->e_phentsize * hdr->e_phnum > PAGE_SIZE - hdr->e_phoff) {
+ 		error = ENOEXEC;
+@@ -789,16 +795,7 @@ __CONCAT(exec_, __elfN(imgact))(struct image_params *imgp)
+ 	if (hdr->e_type == ET_DYN) {
+ 		if ((brand_info->flags & BI_CAN_EXEC_DYN) == 0)
+ 			return (ENOEXEC);
+-		/*
+-		 * Honour the base load address from the dso if it is
+-		 * non-zero for some reason.
+-		 */
+-		if (baddr == 0)
+-			et_dyn_addr = ET_DYN_LOAD_ADDR;
+-		else
+-			et_dyn_addr = 0;
+-	} else
+-		et_dyn_addr = 0;
++	}
+ 	sv = brand_info->sysvec;
+ 	if (interp != NULL && brand_info->interp_newpath != NULL)
+ 		newinterp = brand_info->interp_newpath;
+@@ -819,6 +816,27 @@ __CONCAT(exec_, __elfN(imgact))(struct image_params *imgp)
+ 	error = exec_new_vmspace(imgp, sv);
+ 	imgp->proc->p_sysent = sv;
+ 
++#if defined(PAX_MPROTECT) || defined(PAX_SEGVGUARD) || defined(PAX_ASLR)
++	pax_elf(imgp, 0);
++#endif
++
++	if (hdr->e_type == ET_DYN) {
++		/*
++		 * Honour the base load address from the dso if it is
++		 * non-zero for some reason.
++		 */
++		if (baddr == 0) {
++			et_dyn_addr = ET_DYN_LOAD_ADDR;
++#ifdef PAX_ASLR
++			if (pax_aslr_active(NULL, imgp->proc)) {
++				et_dyn_addr += imgp->proc->p_vmspace->vm_aslr_delta_exec;
++			}
++#endif
++		} else
++			et_dyn_addr = 0;
++	} else
++		et_dyn_addr = 0;
++
+ 	vn_lock(imgp->vp, LK_EXCLUSIVE | LK_RETRY);
+ 	if (error)
+ 		return (error);
+diff --git a/sys/kern/init_main.c b/sys/kern/init_main.c
+index 141d438..9301b57 100644
+--- a/sys/kern/init_main.c
++++ b/sys/kern/init_main.c
+@@ -410,6 +410,7 @@ struct sysentvec null_sysvec = {
+ 	.sv_fetch_syscall_args = null_fetch_syscall_args,
+ 	.sv_syscallnames = NULL,
+ 	.sv_schedtail	= NULL,
++	.sv_pax_aslr_init = NULL,
+ };
+ 
+ /*
+diff --git a/sys/kern/kern_exec.c b/sys/kern/kern_exec.c
+index 9f223ca..e279d45 100644
+--- a/sys/kern/kern_exec.c
++++ b/sys/kern/kern_exec.c
+@@ -30,6 +30,7 @@ __FBSDID("$FreeBSD$");
+ #include "opt_capsicum.h"
+ #include "opt_hwpmc_hooks.h"
+ #include "opt_ktrace.h"
++#include "opt_pax.h"
+ #include "opt_vm.h"
+ 
+ #include <sys/param.h>
+@@ -94,6 +95,10 @@ __FBSDID("$FreeBSD$");
+ dtrace_execexit_func_t	dtrace_fasttrap_exec;
+ #endif
+ 
++#if defined(PAX_ASLR) || defined(PAX_SEGVGUARD)
++#include <sys/pax.h>
++#endif
++
+ SDT_PROVIDER_DECLARE(proc);
+ SDT_PROBE_DEFINE1(proc, kernel, , exec, "char *");
+ SDT_PROBE_DEFINE1(proc, kernel, , exec__failure, "int");
+@@ -395,6 +400,7 @@ do_execve(td, args, mac_p)
+ 	imgp->pagesizes = 0;
+ 	imgp->pagesizeslen = 0;
+ 	imgp->stack_prot = 0;
++	imgp->pax_flags = 0;
+ 
+ #ifdef MAC
+ 	error = mac_execve_enter(imgp, mac_p);
+@@ -500,6 +506,11 @@ interpret:
+ 		error = (*execsw[i]->ex_imgact)(imgp);
+ 	}
+ 
++#ifdef PAX_SEGVGUARD
++	if (!error)
++		error = pax_segvguard(curthread, imgp->vp, args->fname, 0);
++#endif
++
+ 	if (error) {
+ 		if (error == -1) {
+ 			if (textset == 0)
+@@ -1055,6 +1066,10 @@ exec_new_vmspace(imgp, sv)
+ 		map = &vmspace->vm_map;
+ 	}
+ 
++#ifdef PAX_ASLR
++	pax_aslr_init(curthread, imgp);
++#endif
++
+ 	/* Map a shared page */
+ 	obj = sv->sv_shared_page_obj;
+ 	if (obj != NULL) {
+@@ -1231,6 +1246,9 @@ exec_copyout_strings(imgp)
+ {
+ 	int argc, envc;
+ 	char **vectp;
++#ifdef PAX_ASLR
++	uintptr_t orig_destp;
++#endif
+ 	char *stringp;
+ 	uintptr_t destp;
+ 	register_t *stack_base;
+@@ -1257,6 +1275,10 @@ exec_copyout_strings(imgp)
+ 			szsigcode = *(p->p_sysent->sv_szsigcode);
+ 	}
+ 	destp =	(uintptr_t)arginfo;
++#ifdef PAX_ASLR
++	orig_destp = destp;
++	pax_aslr_stack(curthread, &destp, orig_destp);
++#endif
+ 
+ 	/*
+ 	 * install sigcode
+diff --git a/sys/kern/kern_fork.c b/sys/kern/kern_fork.c
+index b3d9c24..3f4e8e3 100644
+--- a/sys/kern/kern_fork.c
++++ b/sys/kern/kern_fork.c
+@@ -39,6 +39,7 @@ __FBSDID("$FreeBSD$");
+ 
+ #include "opt_ktrace.h"
+ #include "opt_kstack_pages.h"
++#include "opt_pax.h"
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -53,6 +54,7 @@ __FBSDID("$FreeBSD$");
+ #include <sys/lock.h>
+ #include <sys/malloc.h>
+ #include <sys/mutex.h>
++#include <sys/pax.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/procdesc.h>
+@@ -513,6 +515,11 @@ do_fork(struct thread *td, int flags, struct proc *p2, struct thread *td2,
+ 	}
+ 
+ 	/*
++	 * XXXOP: this is the right place?
++	 */
++	p2->p_pax = p1->p_pax;
++
++	/*
+ 	 * p_limit is copy-on-write.  Bump its refcount.
+ 	 */
+ 	lim_fork(p1, p2);
+@@ -753,6 +760,14 @@ fork1(struct thread *td, int flags, int pages, struct proc **procp,
+ 	static struct timeval lastfail;
+ 	struct file *fp_procdesc = NULL;
+ 
++#ifdef PAX_SEGVGUARD
++	if (td->td_proc->p_pid != 0) {
++		error = pax_segvguard(curthread, curthread->td_proc->p_textvp, td->td_proc->p_comm, 0);
++		if (error)
++			return (error);
++	}
++#endif
++
+ 	/* Check for the undefined or unimplemented flags. */
+ 	if ((flags & ~(RFFLAGS | RFTSIGFLAGS(RFTSIGMASK))) != 0)
+ 		return (EINVAL);
+diff --git a/sys/kern/kern_jail.c b/sys/kern/kern_jail.c
+index 47cd568..699647e 100644
+--- a/sys/kern/kern_jail.c
++++ b/sys/kern/kern_jail.c
+@@ -33,6 +33,7 @@ __FBSDID("$FreeBSD$");
+ #include "opt_ddb.h"
+ #include "opt_inet.h"
+ #include "opt_inet6.h"
++#include "opt_pax.h"
+ 
+ #include <sys/param.h>
+ #include <sys/types.h>
+@@ -74,6 +75,10 @@ __FBSDID("$FreeBSD$");
+ #endif /* INET6 */
+ #endif /* DDB */
+ 
++#if defined(PAX_ASLR) || defined(PAX_SEGVGUARD)
++#include <sys/pax.h>
++#endif
++
+ #include <security/mac/mac_framework.h>
+ 
+ #define	DEFAULT_HOSTUUID	"00000000-0000-0000-0000-000000000000"
+@@ -114,6 +119,39 @@ struct prison prison0 = {
+ 	.pr_flags	= PR_HOST|_PR_IP_SADDRSEL,
+ #endif
+ 	.pr_allow	= PR_ALLOW_ALL,
++#if defined(PAX_ASLR) || defined(PAX_SEGVGUARD)
++	.pr_pax_set		= 0,
++	.pr_pax_aslr_status	= PAX_ASLR_ENABLED,
++	.pr_pax_aslr_debug	= 0,
++	.pr_pax_aslr_mmap_len	= PAX_ASLR_DELTA_MMAP_MIN_LEN,
++	.pr_pax_aslr_stack_len	= PAX_ASLR_DELTA_STACK_MIN_LEN,
++	.pr_pax_aslr_exec_len	= PAX_ASLR_DELTA_EXEC_MIN_LEN,
++	.pr_pax_aslr_compat_status	= PAX_ASLR_ENABLED,
++	.pr_pax_aslr_compat_mmap_len	= PAX_ASLR_COMPAT_DELTA_MMAP_MIN_LEN,
++	.pr_pax_aslr_compat_stack_len	= PAX_ASLR_COMPAT_DELTA_STACK_MIN_LEN,
++	.pr_pax_aslr_compat_exec_len	= PAX_ASLR_COMPAT_DELTA_EXEC_MIN_LEN,
++	.pr_pax_segvguard_status	= PAX_SEGVGUARD_ENABLED,
++	.pr_pax_segvguard_debug		= 0,
++	.pr_pax_segvguard_expiry	= PAX_SEGVGUARD_EXPIRY,
++	.pr_pax_segvguard_suspension	= PAX_SEGVGUARD_SUSPENSION,
++	.pr_pax_segvguard_maxcrashes	= PAX_SEGVGUARD_MAXCRASHES,
++#else
++	.pr_pax_set		= 0,
++	.pr_pax_aslr_status	= 0,
++	.pr_pax_aslr_debug	= 0,
++	.pr_pax_aslr_mmap_len	= 0,
++	.pr_pax_aslr_stack_len	= 0,
++	.pr_pax_aslr_exec_len	= 0,
++	.pr_pax_aslr_compat_status	= 0,
++	.pr_pax_aslr_compat_mmap_len	= 0,
++	.pr_pax_aslr_compat_stack_len	= 0,
++	.pr_pax_aslr_compat_exec_len	= 0,
++	.pr_pax_segvguard_status	= 0,
++	.pr_pax_segvguard_debug		= 0,
++	.pr_pax_segvguard_expiry	= 0,
++	.pr_pax_segvguard_suspension	= 0,
++	.pr_pax_segvguard_maxcrashes	= 0,
++#endif
+ };
+ MTX_SYSINIT(prison0, &prison0.pr_mtx, "jail mutex", MTX_DEF);
+ 
+diff --git a/sys/kern/kern_pax.c b/sys/kern/kern_pax.c
+new file mode 100644
+index 0000000..98f858e
+--- /dev/null
++++ b/sys/kern/kern_pax.c
+@@ -0,0 +1,163 @@
++
++/*-
++ * Copyright (c) 2013, by Oliver Pinter <oliver.pntr at gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. The name of the developer may NOT be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * $FreeBSD$
++ *
++ * Enhancements made by Shawn "lattera" Webb under the direction of SoldierX.
++ */
++
++#include <sys/cdefs.h>
++__FBSDID("$FreeBSD$");
++
++#include "opt_compat.h"
++#include "opt_pax.h"
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/imgact.h>
++#include <sys/imgact_elf.h>
++#include <sys/sysent.h>
++#include <sys/stat.h>
++#include <sys/proc.h>
++#include <sys/elf_common.h>
++#include <sys/mount.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/queue.h>
++#include <sys/libkern.h>
++#include <sys/jail.h>
++
++#include <sys/mman.h>
++#include <sys/libkern.h>
++#include <sys/exec.h>
++#include <sys/kthread.h>
++
++#include <sys/syslimits.h>
++#include <sys/param.h>
++
++#include <vm/pmap.h>
++#include <vm/vm_map.h>
++#include <vm/vm_extern.h>
++
++#include <machine/elf.h>
++
++#include <sys/pax.h>
++
++#include <security/mac_bsdextended/mac_bsdextended.h>
++
++#ifdef PAX_SEGVGUARD
++extern int pax_segvguard_status;
++extern int pax_segvguard_debug;
++extern int pax_segvguard_expiry;
++extern int pax_segvguard_suspension;
++extern int pax_segvguard_maxcrashes;
++#endif /* PAX_SEGVGUARD */
++
++SYSCTL_NODE(_security, OID_AUTO, pax, CTLFLAG_RD, 0,
++    "PaX (exploit mitigation) features.");
++
++struct prison *
++pax_get_prison(struct thread *td, struct proc *proc)
++{
++	if (td != NULL) {
++		if ((td->td_proc) && (td->td_proc->p_ucred))
++			return td->td_proc->p_ucred->cr_prison;
++
++		return NULL;
++	}
++	if (proc == NULL)
++		return NULL;
++
++	return proc->p_ucred->cr_prison;
++}
++
++void
++pax_elf(struct image_params *imgp, uint32_t mode)
++{
++	u_int flags = 0;
++
++	if ((mode & MBI_ALLPAX) == MBI_ALLPAX)
++		goto end;
++
++	if (mode & MBI_FORCE_ASLR_ENABLED)
++		flags |= ELF_NOTE_PAX_ASLR;
++	else if (mode & MBI_FORCE_ASLR_DISABLED)
++		flags |= ELF_NOTE_PAX_NOASLR;
++
++	if (mode & MBI_FORCE_SEGVGUARD_ENABLED)
++		flags |= ELF_NOTE_PAX_GUARD;
++	else if (mode & MBI_FORCE_SEGVGUARD_DISABLED)
++		flags |= ELF_NOTE_PAX_NOGUARD;
++
++end:
++	if (imgp != NULL) {
++		imgp->pax_flags = flags;
++		if (imgp->proc != NULL) {
++			PROC_LOCK(imgp->proc);
++			imgp->proc->p_pax = flags;
++			PROC_UNLOCK(imgp->proc);
++		}
++	}
++}
++
++void
++pax_init_prison(struct prison *pr)
++{
++	if (pr == NULL)
++		return;
++
++	if (pr->pr_pax_set)
++		return;
++
++	if (pax_aslr_debug)
++		uprintf("[PaX ASLR/SEGVGUARD] %s: Setting prison %s ASLR variables\n",
++		    __func__, pr->pr_name);
++
++#ifdef PAX_ASLR
++	pr->pr_pax_aslr_status = pax_aslr_status;
++	pr->pr_pax_aslr_debug = pax_aslr_debug;
++	pr->pr_pax_aslr_mmap_len = pax_aslr_mmap_len;
++	pr->pr_pax_aslr_stack_len = pax_aslr_stack_len;
++	pr->pr_pax_aslr_exec_len = pax_aslr_exec_len;
++
++#ifdef COMPAT_FREEBSD32
++	pr->pr_pax_aslr_compat_status = pax_aslr_compat_status;
++	pr->pr_pax_aslr_compat_mmap_len = pax_aslr_compat_mmap_len;
++	pr->pr_pax_aslr_compat_stack_len = pax_aslr_compat_stack_len;
++	pr->pr_pax_aslr_compat_exec_len = pax_aslr_compat_exec_len;
++#endif
++#endif
++
++#ifdef PAX_SEGVGUARD
++	pr->pr_pax_segvguard_status = pax_segvguard_status;
++	pr->pr_pax_segvguard_debug = pax_segvguard_debug;
++	pr->pr_pax_segvguard_expiry = pax_segvguard_expiry;
++	pr->pr_pax_segvguard_suspension = pax_segvguard_suspension;
++	pr->pr_pax_segvguard_maxcrashes = pax_segvguard_maxcrashes;
++#endif
++
++	pr->pr_pax_set = 1;
++}
+diff --git a/sys/kern/kern_pax_aslr.c b/sys/kern/kern_pax_aslr.c
+new file mode 100644
+index 0000000..05ceb02
+--- /dev/null
++++ b/sys/kern/kern_pax_aslr.c
+@@ -0,0 +1,617 @@
++/*-
++ * Copyright (c) 2013, by Oliver Pinter <oliver.pntr at gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. The name of the developer may NOT be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * $FreeBSD$
++ *
++ * Enhancements made by Shawn "lattera" Webb under the direction of SoldierX.
++ */
++
++#include <sys/cdefs.h>
++__FBSDID("$FreeBSD$");
++
++#include "opt_compat.h"
++#include "opt_pax.h"
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/imgact.h>
++#include <sys/imgact_elf.h>
++#include <sys/sysent.h>
++#include <sys/stat.h>
++#include <sys/proc.h>
++#include <sys/elf_common.h>
++#include <sys/mount.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/queue.h>
++#include <sys/libkern.h>
++#include <sys/jail.h>
++
++#include <sys/mman.h>
++#include <sys/libkern.h>
++#include <sys/exec.h>
++#include <sys/kthread.h>
++
++#include <vm/pmap.h>
++#include <vm/vm_map.h>
++#include <vm/vm_extern.h>
++
++#include <machine/elf.h>
++
++#include <sys/pax.h>
++
++#ifdef PAX_ASLR_MAX_SEC
++int pax_aslr_mmap_len = PAX_ASLR_DELTA_MMAP_MAX_LEN;
++int pax_aslr_stack_len = PAX_ASLR_DELTA_STACK_MAX_LEN;
++int pax_aslr_exec_len = PAX_ASLR_DELTA_EXEC_MAX_LEN;
++#else
++int pax_aslr_mmap_len = PAX_ASLR_DELTA_MMAP_DEF_LEN;
++int pax_aslr_stack_len = PAX_ASLR_DELTA_STACK_DEF_LEN;
++int pax_aslr_exec_len = PAX_ASLR_DELTA_EXEC_DEF_LEN;
++#endif /* PAX_ASLR_MAX_SEC */
++
++#ifdef COMPAT_FREEBSD32
++#ifdef PAX_ASLR_MAX_SEC
++int pax_aslr_compat_mmap_len = PAX_ASLR_COMPAT_DELTA_MMAP_MAX_LEN;
++int pax_aslr_compat_stack_len = PAX_ASLR_COMPAT_DELTA_STACK_MAX_LEN;
++int pax_aslr_compat_exec_len = PAX_ASLR_COMPAT_DELTA_EXEC_MAX_LEN;
++#else
++int pax_aslr_compat_mmap_len = PAX_ASLR_COMPAT_DELTA_MMAP_MIN_LEN;
++int pax_aslr_compat_stack_len = PAX_ASLR_COMPAT_DELTA_STACK_MIN_LEN;
++int pax_aslr_compat_exec_len = PAX_ASLR_COMPAT_DELTA_EXEC_MIN_LEN;
++#endif /* PAX_ASLR_MAX_SEC */
++#endif /* COMPAT_FREEBSD32 */
++
++/*
++ * sysctls and tunables
++ */
++static int sysctl_pax_aslr_debug(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_status(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_mmap(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_stack(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_exec(SYSCTL_HANDLER_ARGS);
++
++int pax_aslr_status = PAX_ASLR_ENABLED;
++int pax_aslr_debug = 0;
++
++SYSCTL_DECL(_security_pax);
++
++SYSCTL_NODE(_security_pax, OID_AUTO, aslr, CTLFLAG_RD, 0,
++    "Address Space Layout Randomization.");
++
++SYSCTL_PROC(_security_pax_aslr, OID_AUTO, status,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_aslr_status, "I",
++    "Restrictions status. "
++    "0 - disabled, "
++    "1 - opt-in,  "
++    "2 - opt-out, "
++    "3 - force enabled");
++TUNABLE_INT("security.pax.aslr.status", &pax_aslr_status);
++
++SYSCTL_PROC(_security_pax_aslr, OID_AUTO, debug,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_aslr_debug, "I",
++    "ASLR debug mode");
++TUNABLE_INT("security.pax.aslr.debug", &pax_aslr_debug);
++
++SYSCTL_PROC(_security_pax_aslr, OID_AUTO, mmap_len,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_aslr_mmap, "I",
++    "Number of bits randomized for mmap(2) calls. "
++    "32 bit: [8,16] 64 bit: [16,32]");
++TUNABLE_INT("security.pax.aslr.mmap_len", &pax_aslr_mmap_len);
++
++SYSCTL_PROC(_security_pax_aslr, OID_AUTO, stack_len,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_aslr_stack, "I",
++    "Number of bits randomized for the stack. "
++    "32 bit: [6,12] 64 bit: [12,21]");
++TUNABLE_INT("security.pax.aslr.stack_len", &pax_aslr_stack_len);
++
++SYSCTL_PROC(_security_pax_aslr, OID_AUTO, exec_len,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_aslr_exec, "I",
++    "Number of bits randomized for the PIE exec base. "
++    "32 bit: [6,12] 64 bit: [12,21]");
++TUNABLE_INT("security.pax.aslr.exec_len", &pax_aslr_exec_len);
++
++static int
++sysctl_pax_aslr_status(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_status : pax_aslr_status;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	switch (val) {
++	case    PAX_ASLR_DISABLED:
++	case    PAX_ASLR_ENABLED:
++	case    PAX_ASLR_GLOBAL_ENABLED:
++	case    PAX_ASLR_FORCE_GLOBAL_ENABLED:
++		if ((pr == NULL) || (pr == &prison0))
++			pax_aslr_status = val;
++		if (pr != NULL)
++			pr->pr_pax_aslr_status = val;
++		break;
++	default:
++		return (EINVAL);
++	}
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_debug(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_debug : pax_aslr_debug;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || !req->newptr)
++		return (err);
++
++	if (val != 0 || val != 1)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_debug = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_debug = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_mmap(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_mmap_len : pax_aslr_mmap_len;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || !req->newptr)
++		return (err);
++
++	if (val < PAX_ASLR_DELTA_MMAP_MIN_LEN ||
++	    val > PAX_ASLR_DELTA_MMAP_MAX_LEN)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_mmap_len = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_mmap_len = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_stack(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_stack_len : pax_aslr_stack_len;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || !req->newptr)
++		return (err);
++
++	if (val < PAX_ASLR_DELTA_STACK_MIN_LEN ||
++	    val > PAX_ASLR_DELTA_STACK_MAX_LEN)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_stack_len = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_stack_len = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_exec(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_exec_len : pax_aslr_exec_len;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	if (val < PAX_ASLR_DELTA_EXEC_MIN_LEN ||
++	    val > PAX_ASLR_DELTA_EXEC_MAX_LEN)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_exec_len = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_exec_len = val;
++
++	return (0);
++}
++
++/*
++ * COMPAT_FREEBSD32 and linuxulator..
++ */
++#ifdef COMPAT_FREEBSD32
++int pax_aslr_compat_status = PAX_ASLR_ENABLED;
++
++static int sysctl_pax_aslr_compat_status(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_compat_mmap(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_compat_stack(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_aslr_compat_exec(SYSCTL_HANDLER_ARGS);
++
++SYSCTL_NODE(_security_pax_aslr, OID_AUTO, compat, CTLFLAG_RD, 0,
++    "Setting for COMPAT_FREEBSD32 and linuxulator.");
++
++SYSCTL_PROC(_security_pax_aslr_compat, OID_AUTO, status,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON,
++    NULL, 0, sysctl_pax_aslr_compat_status, "I",
++    "Restrictions status. "
++    "0 - disabled, "
++    "1 - enabled,  "
++    "2 - global enabled, "
++    "3 - force global enabled");
++TUNABLE_INT("security.pax.aslr.compat.status", &pax_aslr_compat_status);
++
++SYSCTL_PROC(_security_pax_aslr_compat, OID_AUTO, mmap_len,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON,
++    NULL, 0, sysctl_pax_aslr_compat_mmap, "I",
++    "Number of bits randomized for mmap(2) calls. "
++    "32 bit: [8,16]");
++TUNABLE_INT("security.pax.aslr.compat.mmap", &pax_aslr_compat_mmap_len);
++
++SYSCTL_PROC(_security_pax_aslr_compat, OID_AUTO, stack_len,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON,
++    NULL, 0, sysctl_pax_aslr_compat_stack, "I",
++    "Number of bits randomized for the stack. "
++    "32 bit: [6,12]");
++TUNABLE_INT("security.pax.aslr.compat.stack", &pax_aslr_compat_stack_len);
++
++SYSCTL_PROC(_security_pax_aslr_compat, OID_AUTO, exec_len,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON,
++    NULL, 0, sysctl_pax_aslr_compat_exec, "I",
++    "Number of bits randomized for the PIE exec base. "
++    "32 bit: [6,12]");
++TUNABLE_INT("security.pax.aslr.compat.stack", &pax_aslr_compat_exec_len);
++
++static int
++sysctl_pax_aslr_compat_status(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ?pr->pr_pax_aslr_compat_status : pax_aslr_compat_status;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	switch (val) {
++	case    PAX_ASLR_DISABLED:
++	case    PAX_ASLR_ENABLED:
++	case    PAX_ASLR_GLOBAL_ENABLED:
++	case    PAX_ASLR_FORCE_GLOBAL_ENABLED:
++		if ((pr == NULL) || (pr == &prison0))
++			pax_aslr_compat_status = val;
++		if (pr != NULL)
++			pr->pr_pax_aslr_compat_status = val;
++		break;
++	default:
++		return (EINVAL);
++	}
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_compat_mmap(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_compat_mmap_len : pax_aslr_compat_mmap_len;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || !req->newptr)
++		return (err);
++
++	if (val < PAX_ASLR_COMPAT_DELTA_MMAP_MIN_LEN ||
++	    val > PAX_ASLR_COMPAT_DELTA_MMAP_MAX_LEN)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_compat_mmap_len = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_compat_mmap_len = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_compat_stack(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_compat_stack_len : pax_aslr_compat_stack_len;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || !req->newptr)
++		return (err);
++
++	if (val < PAX_ASLR_COMPAT_DELTA_STACK_MIN_LEN ||
++	    val > PAX_ASLR_COMPAT_DELTA_STACK_MAX_LEN)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_compat_stack_len = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_compat_stack_len = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_aslr_compat_exec(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_aslr_compat_exec_len : pax_aslr_compat_exec_len;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || !req->newptr)
++		return (err);
++
++	if (val < PAX_ASLR_COMPAT_DELTA_EXEC_MIN_LEN ||
++	    val > PAX_ASLR_COMPAT_DELTA_EXEC_MAX_LEN)
++		return (EINVAL);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_aslr_compat_exec_len = val;
++	if (pr != NULL)
++		pr->pr_pax_aslr_compat_exec_len = val;
++
++	return (0);
++}
++
++#endif /* COMPAT_FREEBSD32 */
++
++
++/*
++ * ASLR functions
++ */
++bool
++pax_aslr_active(struct thread *td, struct proc *proc)
++{
++	int status;
++	struct prison *pr=NULL;
++	uint32_t flags;
++
++	if ((td == NULL) && (proc == NULL))
++		return (true);
++
++	flags = (td != NULL) ? td->td_proc->p_pax : proc->p_pax;
++	pr = pax_get_prison(td, proc);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	status = (pr != NULL) ? pr->pr_pax_aslr_status : pax_aslr_status;
++
++	switch (status) {
++	case    PAX_ASLR_DISABLED:
++		return (false);
++	case    PAX_ASLR_FORCE_GLOBAL_ENABLED:
++		return (true);
++	case    PAX_ASLR_ENABLED:
++		if (flags && (flags & ELF_NOTE_PAX_ASLR) == 0) {
++			if ((pr != NULL) && pr->pr_pax_aslr_debug)
++				uprintf("[PaX ASLR] %s: PAX is enabled, but executable does not have pax enabled\n",
++						__func__);
++			return (false);
++		}
++		break;
++	case    PAX_ASLR_GLOBAL_ENABLED:
++		if (flags && (flags & ELF_NOTE_PAX_NOASLR) != 0) {
++			if ((pr != NULL) && pr->pr_pax_aslr_debug)
++				uprintf("[PaX ASLR] %s: PAX global is eanbled, but executable explicitly disabled pax\n",
++						__func__);
++			return (false);
++		}
++		break;
++	default:
++		return (true);
++	}
++
++	return (true);
++}
++
++void
++_pax_aslr_init(struct vmspace *vm, struct prison *pr)
++{
++	if (vm == NULL)
++		panic("[PaX ASLR] %s: vm == NULL", __func__);
++
++	vm->vm_aslr_delta_mmap = PAX_ASLR_DELTA(arc4random(),
++			PAX_ASLR_DELTA_MMAP_LSB, (pr != NULL) ? pr->pr_pax_aslr_mmap_len : pax_aslr_mmap_len);
++	vm->vm_aslr_delta_stack = PAX_ASLR_DELTA(arc4random(),
++			PAX_ASLR_DELTA_STACK_LSB, (pr != NULL) ? pr->pr_pax_aslr_stack_len : pax_aslr_stack_len);
++	vm->vm_aslr_delta_stack = ALIGN(vm->vm_aslr_delta_stack);
++	vm->vm_aslr_delta_exec = PAX_ASLR_DELTA(arc4random(),
++			PAX_ASLR_DELTA_EXEC_LSB, (pr != NULL) ? pr->pr_pax_aslr_exec_len : pax_aslr_exec_len);
++
++	if ((pr != NULL) && pr->pr_pax_aslr_debug) {
++		uprintf("[PaX ASLR] %s: vm_aslr_delta_mmap=%p\n", __func__, (void *) vm->vm_aslr_delta_mmap);
++		uprintf("[PaX ASLR] %s: vm_aslr_delta_stack=%p\n", __func__, (void *) vm->vm_aslr_delta_stack);
++		uprintf("[PaX ASLR] %s: vm_aslr_delta_exec=%p\n", __func__, (void *) vm->vm_aslr_delta_exec);
++	}
++}
++
++#ifdef COMPAT_FREEBSD32
++void
++_pax_aslr_init32(struct vmspace *vm, struct prison *pr)
++{
++	if (vm == NULL)
++		panic("[PaX ASLR] %s: vm == NULL", __func__);
++
++	vm->vm_aslr_delta_mmap = PAX_ASLR_DELTA(arc4random(),
++			PAX_ASLR_COMPAT_DELTA_MMAP_LSB, (pr != NULL) ? pr->pr_pax_aslr_compat_mmap_len : pax_aslr_compat_mmap_len);
++	vm->vm_aslr_delta_stack = PAX_ASLR_DELTA(arc4random(),
++			PAX_ASLR_COMPAT_DELTA_STACK_LSB, (pr != NULL) ? pr->pr_pax_aslr_compat_stack_len : pax_aslr_compat_stack_len);
++	vm->vm_aslr_delta_stack = ALIGN(vm->vm_aslr_delta_stack);
++	vm->vm_aslr_delta_exec = PAX_ASLR_DELTA(arc4random(),
++			PAX_ASLR_DELTA_EXEC_LSB, (pr != NULL) ? pr->pr_pax_aslr_compat_exec_len : pax_aslr_compat_exec_len);
++
++	if ((pr != NULL) && pr->pr_pax_aslr_debug) {
++		uprintf("[PaX ASLR] %s: vm_aslr_delta_mmap=%p\n", __func__, (void *) vm->vm_aslr_delta_mmap);
++		uprintf("[PaX ASLR] %s: vm_aslr_delta_stack=%p\n", __func__, (void *) vm->vm_aslr_delta_stack);
++		uprintf("[PaX ASLR] %s: vm_aslr_delta_exec=%p\n", __func__, (void *) vm->vm_aslr_delta_exec);
++	}
++}
++#endif
++
++void
++pax_aslr_init(struct thread *td, struct image_params *imgp)
++{
++	struct vmspace *vm;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	if (imgp == NULL) {
++		panic("[PaX ASLR] %s: imgp == NULL", __func__);
++	}
++
++	if (!pax_aslr_active(td, NULL))
++		return;
++
++	vm = imgp->proc->p_vmspace;
++
++	if (imgp->sysent->sv_pax_aslr_init != NULL) {
++		imgp->sysent->sv_pax_aslr_init(vm, pr);
++	}
++}
++
++void
++pax_aslr_mmap(struct thread *td, vm_offset_t *addr, vm_offset_t orig_addr, int flags)
++{
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(td, NULL);
++
++	if (!pax_aslr_active(td, NULL))
++		return;
++
++	if (!(flags & MAP_FIXED) && ((orig_addr == 0) || !(flags & MAP_ANON))) {
++		if ((pr != NULL) && pr->pr_pax_aslr_debug)
++			uprintf("[PaX ASLR] %s: applying to %p orig_addr=%p flags=%x\n",
++					__func__, (void *)*addr, (void *)orig_addr, flags);
++		if (!(td->td_proc->p_vmspace->vm_map.flags & MAP_ENTRY_GROWS_DOWN))
++			*addr += td->td_proc->p_vmspace->vm_aslr_delta_mmap;
++		else
++			*addr -= td->td_proc->p_vmspace->vm_aslr_delta_mmap;
++		if ((pr != NULL) && pr->pr_pax_aslr_debug)
++			uprintf("[PaX ASLR] %s: result %p\n", __func__, (void *)*addr);
++	} else if ((pr != NULL) && pr->pr_pax_aslr_debug) {
++		uprintf("[PaX ASLR] %s: not applying to %p orig_addr=%p flags=%x\n",
++				__func__, (void *)*addr, (void *)orig_addr, flags);
++	}
++}
++
++void
++pax_aslr_stack(struct thread *td, uintptr_t *addr, uintptr_t orig_addr)
++{
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(td, NULL);
++
++	if (!pax_aslr_active(td, NULL))
++		return;
++
++	*addr -= td->td_proc->p_vmspace->vm_aslr_delta_stack;
++	if (pax_aslr_debug)
++		uprintf("[PaX ASLR] %s: orig_addr=%p, new_addr=%p\n",
++				__func__, (void *)orig_addr, (void *)*addr);
++}
+diff --git a/sys/kern/kern_pax_segvguard.c b/sys/kern/kern_pax_segvguard.c
+new file mode 100644
+index 0000000..603047a
+--- /dev/null
++++ b/sys/kern/kern_pax_segvguard.c
+@@ -0,0 +1,490 @@
++/*-
++ * Copyright (c) 2013, by Oliver Pinter <oliver.pntr at gmail.com>
++ * All rights reserved.
++ *
++ * Some parts ported to FreeBSD by
++ * Danilo Egea Gondolfo <danilogondolfo@gmail.com> and
++ * Shawn "lattera" Webb
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. The name of the developer may NOT be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * $FreeBSD$
++ *
++ * Enhancements made by Shawn "lattera" Webb under the direction of SoldierX.
++ */
++
++#include <sys/cdefs.h>
++__FBSDID("$FreeBSD$");
++
++#include "opt_compat.h"
++#include "opt_pax.h"
++
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/imgact.h>
++#include <sys/imgact_elf.h>
++#include <sys/sysent.h>
++#include <sys/stat.h>
++#include <sys/proc.h>
++#include <sys/elf_common.h>
++#include <sys/mount.h>
++#include <sys/sysctl.h>
++#include <sys/vnode.h>
++#include <sys/queue.h>
++#include <sys/libkern.h>
++#include <sys/jail.h>
++
++#include <sys/mman.h>
++#include <sys/libkern.h>
++#include <sys/exec.h>
++#include <sys/kthread.h>
++
++#include <vm/pmap.h>
++#include <vm/vm_map.h>
++#include <vm/vm_extern.h>
++
++#include <machine/elf.h>
++
++#include <sys/pax.h>
++
++int pax_segvguard_status = PAX_SEGVGUARD_ENABLED;
++int pax_segvguard_debug = 0;
++int pax_segvguard_expiry = PAX_SEGVGUARD_EXPIRY;
++int pax_segvguard_suspension = PAX_SEGVGUARD_SUSPENSION;
++int pax_segvguard_maxcrashes = PAX_SEGVGUARD_MAXCRASHES;
++
++struct pax_segvguard_uid_entry {
++	uid_t sue_uid;
++	size_t sue_ncrashes;
++	sbintime_t sue_expiry;
++	sbintime_t sue_suspended;
++	LIST_ENTRY(pax_segvguard_uid_entry) sue_list;
++};
++
++struct pax_segvguard_vnodes {
++	ino_t sv_inode;
++	char sv_mntpoint[MNAMELEN];
++	LIST_ENTRY(pax_segvguard_vnodes) sv_list;
++	LIST_HEAD(, pax_segvguard_uid_entry) uid_list;
++};
++
++static LIST_HEAD(, pax_segvguard_vnodes) vnode_list = LIST_HEAD_INITIALIZER(&vnode_list);
++struct mtx segvguard_mtx;
++
++static int sysctl_pax_segvguard_status(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_segvguard_debug(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_segvguard_expiry(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_segvguard_suspension(SYSCTL_HANDLER_ARGS);
++static int sysctl_pax_segvguard_maxcrashes(SYSCTL_HANDLER_ARGS);
++
++static bool pax_segvguard_active(struct thread *td, struct proc *proc);
++
++SYSCTL_DECL(_security_pax);
++
++SYSCTL_NODE(_security_pax, OID_AUTO, segvguard, CTLFLAG_RD, 0, "PaX segvguard");
++
++SYSCTL_PROC(_security_pax_segvguard, OID_AUTO, status,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_segvguard_status, "I",
++    "Guard status. "
++    "0 - disabled, "
++    "1 - opt-in,  "
++    "2 - opt-out, "
++    "3 - force enabled");
++TUNABLE_INT("security.pax.segvguard.status", &pax_segvguard_status);
++
++SYSCTL_PROC(_security_pax_segvguard, OID_AUTO, debug,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_segvguard_debug, "I",
++    "Debug mode.");
++TUNABLE_INT("security.pax.segvguard.debug", &pax_segvguard_debug);
++
++SYSCTL_PROC(_security_pax_segvguard, OID_AUTO, expiry_timeout,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_segvguard_expiry, "I",
++    "Entry expiry timeout (in seconds).");
++TUNABLE_INT("security.pax.segvguard.expiry_timeout", &pax_segvguard_expiry);
++
++SYSCTL_PROC(_security_pax_segvguard, OID_AUTO, suspend_timeout,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_segvguard_suspension, "I",
++    "Entry suspension timeout (in seconds).");
++TUNABLE_INT("security.pax.segvguard.suspend_timeout", &pax_segvguard_suspension);
++
++SYSCTL_PROC(_security_pax_segvguard, OID_AUTO, max_crashes,
++    CTLTYPE_INT|CTLFLAG_RWTUN|CTLFLAG_PRISON|CTLFLAG_SECURE,
++    NULL, 0, sysctl_pax_segvguard_maxcrashes, "I",
++    "Max number of crashes before expiry.");
++TUNABLE_INT("security.pax.segvguard.max_crashes", &pax_segvguard_maxcrashes);
++
++static int
++sysctl_pax_segvguard_status(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_segvguard_status : pax_segvguard_status;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	switch (val) {
++	case    PAX_SEGVGUARD_DISABLED:
++	case    PAX_SEGVGUARD_ENABLED:
++	case    PAX_SEGVGUARD_GLOBAL_ENABLED:
++	case    PAX_SEGVGUARD_FORCE_GLOBAL_ENABLED:
++		if ((pr == NULL) || (pr == &prison0))
++			pax_segvguard_status = val;
++		if (pr != NULL)
++			pr->pr_pax_segvguard_status = val;
++		break;
++	default:
++		return (EINVAL);
++	}
++
++	return (0);
++}
++
++static int
++sysctl_pax_segvguard_expiry(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_segvguard_expiry : pax_segvguard_expiry;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_segvguard_expiry = val;
++	if (pr != NULL)
++		pr->pr_pax_segvguard_expiry = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_segvguard_suspension(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_segvguard_suspension : pax_segvguard_suspension;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_segvguard_suspension = val;
++	if (pr != NULL)
++		pr->pr_pax_segvguard_suspension = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_segvguard_maxcrashes(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_segvguard_maxcrashes : pax_segvguard_maxcrashes;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_segvguard_maxcrashes = val;
++	if (pr != NULL)
++		pr->pr_pax_segvguard_maxcrashes = val;
++
++	return (0);
++}
++
++static int
++sysctl_pax_segvguard_debug(SYSCTL_HANDLER_ARGS)
++{
++	int err;
++	int val;
++	struct prison *pr=NULL;
++
++	pr = pax_get_prison(req->td, NULL);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	val = (pr != NULL) ? pr->pr_pax_segvguard_debug : pax_segvguard_debug;
++	err = sysctl_handle_int(oidp, &val, sizeof(int), req);
++	if (err || (req->newptr == NULL))
++		return (err);
++
++	if ((pr == NULL) || (pr == &prison0))
++		pax_segvguard_debug = val;
++	if (pr != NULL)
++		pr->pr_pax_segvguard_debug = val;
++
++	return (0);
++}
++
++MALLOC_DECLARE(M_PAX);
++MALLOC_DEFINE(M_PAX, "pax_segvguard", "PaX segvguard memory");
++
++bool
++pax_segvguard_active(struct thread *td, struct proc *proc)
++{
++	int status;
++	struct prison *pr=NULL;
++	uint32_t flags;
++
++	if ((td == NULL) && (proc == NULL))
++		return (true);
++
++	flags = (td != NULL) ? td->td_proc->p_pax : proc->p_pax;
++	pr = pax_get_prison(td, proc);
++
++	if ((pr != NULL) && !(pr->pr_pax_set))
++		pax_init_prison(pr);
++
++	status = (pr != NULL) ? pr->pr_pax_segvguard_status : pax_segvguard_status;
++
++	switch (status) {
++	case    PAX_SEGVGUARD_DISABLED:
++		return (false);
++	case    PAX_SEGVGUARD_FORCE_GLOBAL_ENABLED:
++		return (true);
++	case    PAX_SEGVGUARD_ENABLED:
++		if (flags && (flags & ELF_NOTE_PAX_GUARD) == 0)
++			return (false);
++		break;
++	case    PAX_SEGVGUARD_GLOBAL_ENABLED:
++		if (flags && (flags & ELF_NOTE_PAX_NOGUARD) != 0)
++			return (false);
++		break;
++	default:
++		return (true);
++	}
++
++	return (true);
++}
++
++static struct pax_segvguard_vnodes *
++pax_segvguard_add_file(struct vnode *vn, struct stat *sb)
++{
++	struct pax_segvguard_vnodes *v;
++
++	v = malloc(sizeof(struct pax_segvguard_vnodes), M_PAX, M_NOWAIT);
++	if(!v)
++		return (NULL);
++
++	LIST_INIT(&(v->uid_list));
++
++	v->sv_inode = sb->st_ino;
++	strncpy(v->sv_mntpoint, vn->v_mount->mnt_stat.f_mntonname, MNAMELEN);
++	v->sv_mntpoint[MNAMELEN-1] = '\0'; /* IS IT NECESSARY??? */
++
++	LIST_INSERT_HEAD(&vnode_list, v, sv_list);
++
++	return (v);
++}
++
++static int
++pax_segvguard_add_uid(struct thread *td, struct pax_segvguard_vnodes *vn, sbintime_t sbt)
++{
++	struct pax_segvguard_uid_entry *up;
++	struct prison *pr;
++
++	pr = pax_get_prison(td, NULL);
++
++	up = malloc(sizeof(struct pax_segvguard_uid_entry), M_PAX, M_NOWAIT);
++	if (!up)
++		return (ENOMEM);
++
++	up->sue_uid = td->td_ucred->cr_uid;
++	up->sue_ncrashes = 1;
++	up->sue_expiry = sbt + ((pr != NULL) ? pr->pr_pax_segvguard_expiry : pax_segvguard_expiry) * SBT_1S;
++	up->sue_suspended = 0;
++
++	LIST_INSERT_HEAD(&(vn->uid_list), up, sue_list);
++
++	return (0);
++}
++
++int
++pax_segvguard(struct thread *td, struct vnode *v, char *name, bool crashed)
++{
++	struct pax_segvguard_uid_entry *up;
++	struct pax_segvguard_vnodes *vn, *vn_saved=NULL;
++	sbintime_t sbt;
++	struct stat sb;
++	char *mntpoint;
++	struct vnode *vp;
++	bool vnode_found, uid_found;
++	struct prison *pr;
++	int error = 0;
++
++	pr = pax_get_prison(td, NULL);
++
++	if (!pax_segvguard_active(td, NULL))
++		return (0);
++
++	if (v == NULL)
++		return (EFAULT);
++
++	vp = v;
++	vn_stat(vp, &sb, td->td_ucred, NOCRED, curthread);
++	mntpoint = vp->v_mount->mnt_stat.f_mntonname;
++
++	mtx_lock(&segvguard_mtx);
++
++	if (LIST_EMPTY(&vnode_list) && !crashed) {
++		mtx_unlock(&segvguard_mtx);
++		return (0);
++	}
++
++	sbt = sbinuptime();
++
++	if (!LIST_EMPTY(&vnode_list) && !crashed) {
++		LIST_FOREACH(vn, &vnode_list, sv_list) {
++			if (vn->sv_inode == sb.st_ino &&
++			    !strncmp(mntpoint, vn->sv_mntpoint, MNAMELEN)) {
++				LIST_FOREACH(up, &(vn->uid_list), sue_list) {
++					if (td->td_ucred->cr_uid == up->sue_uid) {
++						if(up->sue_suspended > sbt) {
++							printf("PaX Segvguard: [%s] Preventing "
++									"execution due to repeated segfaults.\n", name);
++							mtx_unlock(&segvguard_mtx);
++							return (EPERM);
++						}
++					}
++				}
++			}
++		}
++	}
++
++	/*
++	 * If a program we don't know about crashed, we need to create a new entry for it
++	 */
++	if (LIST_EMPTY(&vnode_list) && crashed) {
++		vn = pax_segvguard_add_file(vp, &sb);
++		if (vn == NULL)
++			return (ENOMEM);
++		error = pax_segvguard_add_uid(td, vn, sbt);
++		mtx_unlock(&segvguard_mtx);
++		return (error);
++	}
++
++	vnode_found = uid_found = 0;
++	if (crashed && !LIST_EMPTY(&vnode_list)) {
++		LIST_FOREACH(vn, &vnode_list, sv_list) {
++			if (vn->sv_inode == sb.st_ino && !strncmp(mntpoint, vn->sv_mntpoint, MNAMELEN)) {
++				vnode_found = 1;
++				vn_saved = vn;
++				LIST_FOREACH(up, &(vn->uid_list), sue_list) {
++					if (td->td_ucred->cr_uid == up->sue_uid) {
++						if (up->sue_expiry < sbt && up->sue_suspended <= sbt) {
++							printf("PaX Segvguard: [%s] Suspension "
++									"expired.\n", name ? name : "unknown");
++							up->sue_ncrashes = 1;
++							up->sue_expiry = sbt + ((pr != NULL) ? pr->pr_pax_segvguard_expiry : pax_segvguard_expiry) * SBT_1S;
++							up->sue_suspended = 0;
++
++							mtx_unlock(&segvguard_mtx);
++							return (0);
++						}
++
++						uid_found = 1;
++						up->sue_ncrashes++;
++						if (up->sue_ncrashes >= pax_segvguard_maxcrashes) {
++							printf("PaX Segvguard: [%s] Suspending "
++									"execution for %d seconds after %zu crashes.\n",
++									name, pax_segvguard_suspension,
++									up->sue_ncrashes);
++							up->sue_suspended = sbt + ((pr != NULL) ? pr->pr_pax_segvguard_suspension : pax_segvguard_suspension) * SBT_1S;
++							up->sue_ncrashes = 0;
++							up->sue_expiry = 0;
++						}
++
++						mtx_unlock(&segvguard_mtx);
++						return (0);
++					}
++				}
++			}
++		}
++	}
++
++	if (crashed) {
++		if (!vnode_found) {
++			vn = pax_segvguard_add_file(vp, &sb);
++			if (vn == NULL){
++				mtx_unlock(&segvguard_mtx);
++				return (ENOMEM);
++			}
++			error = pax_segvguard_add_uid(td, vn, sbt);
++			if (error) {
++				mtx_unlock(&segvguard_mtx);
++				return (ENOMEM);
++			}
++		} else if (!uid_found) {
++			if (vn_saved)
++				error = pax_segvguard_add_uid(td, vn_saved, sbt);
++		}
++	}
++
++	mtx_unlock(&segvguard_mtx);
++
++	return (error);
++}
++
++static void
++pax_segvguard_init(void)
++{
++
++	mtx_init(&segvguard_mtx, "segvguard mutex", NULL, MTX_DEF);
++
++}
++
++SYSINIT(pax_segvguard_init, SI_SUB_LOCK, SI_ORDER_ANY, pax_segvguard_init, NULL);
+diff --git a/sys/kern/kern_sig.c b/sys/kern/kern_sig.c
+index b405779..5de2686 100644
+--- a/sys/kern/kern_sig.c
++++ b/sys/kern/kern_sig.c
+@@ -40,6 +40,7 @@ __FBSDID("$FreeBSD$");
+ #include "opt_compat.h"
+ #include "opt_ktrace.h"
+ #include "opt_core.h"
++#include "opt_pax.h"
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -88,6 +89,10 @@ __FBSDID("$FreeBSD$");
+ 
+ #include <security/audit/audit.h>
+ 
++#if defined(PAX_ASLR) || defined(PAX_SEGVGUARD)
++#include <sys/pax.h>
++#endif
++
+ #define	ONSIG	32		/* NSIG for osig* syscalls.  XXX. */
+ 
+ SDT_PROVIDER_DECLARE(proc);
+@@ -2926,6 +2931,11 @@ sigexit(td, sig)
+ 			    sig & WCOREFLAG ? " (core dumped)" : "");
+ 	} else
+ 		PROC_UNLOCK(p);
++
++#ifdef PAX_SEGVGUARD
++	pax_segvguard(curthread, curthread->td_proc->p_textvp, p->p_comm, 1);
++#endif
++
+ 	exit1(td, W_EXITCODE(0, sig));
+ 	/* NOTREACHED */
+ }
+diff --git a/sys/mips/mips/elf_machdep.c b/sys/mips/mips/elf_machdep.c
+index d374713..f95ba35 100644
+--- a/sys/mips/mips/elf_machdep.c
++++ b/sys/mips/mips/elf_machdep.c
+@@ -28,6 +28,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -49,6 +51,10 @@ __FBSDID("$FreeBSD$");
+ #include <machine/md_var.h>
+ #include <machine/cache.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ #ifdef __mips_n64
+ struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_size	= SYS_MAXSYSCALL,
+@@ -83,6 +89,11 @@ struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ 
+ static Elf64_Brandinfo freebsd_brand_info = {
+@@ -139,6 +150,11 @@ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init32,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ 
+ static Elf32_Brandinfo freebsd_brand_info = {
+diff --git a/sys/mips/mips/freebsd32_machdep.c b/sys/mips/mips/freebsd32_machdep.c
+index dfdf70f..103ad84 100644
+--- a/sys/mips/mips/freebsd32_machdep.c
++++ b/sys/mips/mips/freebsd32_machdep.c
+@@ -31,6 +31,7 @@
+  */
+ 
+ #include "opt_compat.h"
++#include "opt_pax.h"
+ 
+ #define __ELF_WORD_SIZE 32
+ 
+@@ -66,6 +67,10 @@
+ #include <compat/freebsd32/freebsd32_util.h>
+ #include <compat/freebsd32/freebsd32_proto.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ static void freebsd32_exec_setregs(struct thread *, struct image_params *, u_long);
+ static int get_mcontext32(struct thread *, mcontext32_t *, int);
+ static int set_mcontext32(struct thread *, const mcontext32_t *);
+@@ -106,6 +111,11 @@ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = freebsd32_syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init32,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf32_sysvec, &elf32_freebsd_sysvec);
+ 
+diff --git a/sys/powerpc/powerpc/elf32_machdep.c b/sys/powerpc/powerpc/elf32_machdep.c
+index dbe58df..229fe97 100644
+--- a/sys/powerpc/powerpc/elf32_machdep.c
++++ b/sys/powerpc/powerpc/elf32_machdep.c
+@@ -25,6 +25,8 @@
+  * $FreeBSD$
+  */
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -52,6 +54,10 @@
+ #include <machine/reg.h>
+ #include <machine/md_var.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ #ifdef __powerpc64__
+ #include <compat/freebsd32/freebsd32_proto.h>
+ #include <compat/freebsd32/freebsd32_util.h>
+@@ -107,6 +113,11 @@ struct sysentvec elf32_freebsd_sysvec = {
+ 	.sv_shared_page_base = FREEBSD32_SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init32,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf32_sysvec, &elf32_freebsd_sysvec);
+ 
+diff --git a/sys/powerpc/powerpc/elf64_machdep.c b/sys/powerpc/powerpc/elf64_machdep.c
+index 0c41a8d..095f37b0 100644
+--- a/sys/powerpc/powerpc/elf64_machdep.c
++++ b/sys/powerpc/powerpc/elf64_machdep.c
+@@ -25,6 +25,8 @@
+  * $FreeBSD$
+  */
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -48,6 +50,10 @@
+ #include <machine/elf.h>
+ #include <machine/md_var.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_size	= SYS_MAXSYSCALL,
+ 	.sv_table	= sysent,
+@@ -83,6 +89,11 @@ struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_shared_page_base = SHAREDPAGE,
+ 	.sv_shared_page_len = PAGE_SIZE,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ INIT_SYSENTVEC(elf64_sysvec, &elf64_freebsd_sysvec);
+ 
+diff --git a/sys/security/mac_bsdextended/mac_bsdextended.c b/sys/security/mac_bsdextended/mac_bsdextended.c
+index ccbc525..9f8a191 100644
+--- a/sys/security/mac_bsdextended/mac_bsdextended.c
++++ b/sys/security/mac_bsdextended/mac_bsdextended.c
+@@ -47,6 +47,8 @@
+  * firewall-like rules regarding users and file system objects.
+  */
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/acl.h>
+ #include <sys/kernel.h>
+@@ -56,14 +58,20 @@
+ #include <sys/module.h>
+ #include <sys/mount.h>
+ #include <sys/mutex.h>
++#include <sys/param.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
+ #include <sys/systm.h>
+ #include <sys/vnode.h>
+ #include <sys/sysctl.h>
+ #include <sys/syslog.h>
++#include <sys/syslimits.h>
+ #include <sys/stat.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ #include <security/mac/mac_policy.h>
+ #include <security/mac_bsdextended/mac_bsdextended.h>
+ #include <security/mac_bsdextended/ugidfw_internal.h>
+@@ -117,7 +125,6 @@ SYSCTL_INT(_security_mac_bsdextended, OID_AUTO, firstmatch_enabled,
+ static int
+ ugidfw_rule_valid(struct mac_bsdextended_rule *rule)
+ {
+-
+ 	if ((rule->mbr_subject.mbs_flags | MBS_ALL_FLAGS) != MBS_ALL_FLAGS)
+ 		return (EINVAL);
+ 	if ((rule->mbr_subject.mbs_neg | MBS_ALL_FLAGS) != MBS_ALL_FLAGS)
+@@ -129,8 +136,13 @@ ugidfw_rule_valid(struct mac_bsdextended_rule *rule)
+ 	if ((rule->mbr_object.mbo_neg | MBO_TYPE_DEFINED) &&
+ 	    (rule->mbr_object.mbo_type | MBO_ALL_TYPE) != MBO_ALL_TYPE)
+ 		return (EINVAL);
++#ifdef PAX_ASLR
++	if ((rule->mbr_pax | MBI_ALLPAX) != MBI_ALLPAX)
++		return (EINVAL);
++#endif
+ 	if ((rule->mbr_mode | MBI_ALLPERM) != MBI_ALLPERM)
+ 		return (EINVAL);
++
+ 	return (0);
+ }
+ 
+@@ -227,7 +239,7 @@ ugidfw_destroy(struct mac_policy_conf *mpc)
+ 
+ static int
+ ugidfw_rulecheck(struct mac_bsdextended_rule *rule,
+-    struct ucred *cred, struct vnode *vp, struct vattr *vap, int acc_mode)
++    struct ucred *cred, struct vnode *vp, struct vattr *vap, int acc_mode, struct image_params *imgp)
+ {
+ 	int mac_granted, match, priv_granted;
+ 	int i;
+@@ -305,6 +317,10 @@ ugidfw_rulecheck(struct mac_bsdextended_rule *rule,
+ 		match = (bcmp(&(vp->v_mount->mnt_stat.f_fsid),
+ 		    &(rule->mbr_object.mbo_fsid),
+ 		    sizeof(rule->mbr_object.mbo_fsid)) == 0);
++#if defined(PAX_ASLR) || defined(PAX_SEGVGUARD)
++		if (match && rule->mbr_object.mbo_inode)
++			match = (vap->va_fileid == rule->mbr_object.mbo_inode);
++#endif
+ 		if (rule->mbr_object.mbo_neg & MBO_FSID_DEFINED)
+ 			match = !match;
+ 		if (!match)
+@@ -413,6 +429,11 @@ ugidfw_rulecheck(struct mac_bsdextended_rule *rule,
+ 		return (EACCES);
+ 	}
+ 
++#ifdef PAX_ASLR
++	if (imgp != NULL)
++		pax_elf(imgp, rule->mbr_pax);
++#endif
++
+ 	/*
+ 	 * If the rule matched, permits access, and first match is enabled,
+ 	 * return success.
+@@ -425,7 +446,7 @@ ugidfw_rulecheck(struct mac_bsdextended_rule *rule,
+ 
+ int
+ ugidfw_check(struct ucred *cred, struct vnode *vp, struct vattr *vap,
+-    int acc_mode)
++    int acc_mode, struct image_params *imgp)
+ {
+ 	int error, i;
+ 
+@@ -441,7 +462,7 @@ ugidfw_check(struct ucred *cred, struct vnode *vp, struct vattr *vap,
+ 		if (rules[i] == NULL)
+ 			continue;
+ 		error = ugidfw_rulecheck(rules[i], cred,
+-		    vp, vap, acc_mode);
++		    vp, vap, acc_mode, imgp);
+ 		if (error == EJUSTRETURN)
+ 			break;
+ 		if (error) {
+@@ -454,7 +475,7 @@ ugidfw_check(struct ucred *cred, struct vnode *vp, struct vattr *vap,
+ }
+ 
+ int
+-ugidfw_check_vp(struct ucred *cred, struct vnode *vp, int acc_mode)
++ugidfw_check_vp(struct ucred *cred, struct vnode *vp, int acc_mode, struct image_params *imgp)
+ {
+ 	int error;
+ 	struct vattr vap;
+@@ -464,7 +485,7 @@ ugidfw_check_vp(struct ucred *cred, struct vnode *vp, int acc_mode)
+ 	error = VOP_GETATTR(vp, &vap, cred);
+ 	if (error)
+ 		return (error);
+-	return (ugidfw_check(cred, vp, &vap, acc_mode));
++	return (ugidfw_check(cred, vp, &vap, acc_mode, imgp));
+ }
+ 
+ int
+diff --git a/sys/security/mac_bsdextended/mac_bsdextended.h b/sys/security/mac_bsdextended/mac_bsdextended.h
+index c09abc0..8026a57 100644
+--- a/sys/security/mac_bsdextended/mac_bsdextended.h
++++ b/sys/security/mac_bsdextended/mac_bsdextended.h
+@@ -51,6 +51,12 @@
+ #define	MBI_ADMIN	010000
+ #define	MBI_STAT	020000
+ #define	MBI_APPEND	040000
++#define MBI_FORCE_ASLR_ENABLED          0x01
++#define MBI_FORCE_ASLR_DISABLED         0x02
++#define MBI_FORCE_SEGVGUARD_ENABLED     0x04
++#define MBI_FORCE_SEGVGUARD_DISABLED    0x08
++#define MBI_ALLPAX (MBI_FORCE_ASLR_ENABLED | MBI_FORCE_ASLR_DISABLED | \
++        MBI_FORCE_SEGVGUARD_ENABLED | MBI_FORCE_SEGVGUARD_DISABLED)
+ #define	MBI_ALLPERM	(MBI_EXEC | MBI_WRITE | MBI_READ | MBI_ADMIN | \
+ 			    MBI_STAT | MBI_APPEND)
+ 
+@@ -78,6 +84,7 @@ struct mac_bsdextended_subject {
+ #define	MBO_UID_SUBJECT	0x00000020	/* uid must match subject */
+ #define	MBO_GID_SUBJECT	0x00000040	/* gid must match subject */
+ #define	MBO_TYPE_DEFINED 0x00000080	/* object type should be matched */
++#define MBO_PAXPATH_DEFINED 0x00000100 /* TODO: paxpath should be matched */
+ 
+ #define MBO_ALL_FLAGS (MBO_UID_DEFINED | MBO_GID_DEFINED | MBO_FSID_DEFINED | \
+ 	    MBO_SUID | MBO_SGID | MBO_UID_SUBJECT | MBO_GID_SUBJECT | \
+@@ -103,12 +110,15 @@ struct mac_bsdextended_object {
+ 	gid_t	mbo_gid_max;
+ 	struct fsid mbo_fsid;
+ 	int	mbo_type;
++	ino_t	mbo_inode;
++	char	mbo_paxpath[MAXPATHLEN];
+ };
+ 
+ struct mac_bsdextended_rule {
+ 	struct mac_bsdextended_subject	mbr_subject;
+ 	struct mac_bsdextended_object	mbr_object;
+ 	mode_t				mbr_mode;	/* maximum access */
++	uint32_t			mbr_pax;
+ };
+ 
+ #endif /* _SYS_SECURITY_MAC_BSDEXTENDED_H */
+diff --git a/sys/security/mac_bsdextended/ugidfw_internal.h b/sys/security/mac_bsdextended/ugidfw_internal.h
+index 5597fd1..ef98274 100644
+--- a/sys/security/mac_bsdextended/ugidfw_internal.h
++++ b/sys/security/mac_bsdextended/ugidfw_internal.h
+@@ -36,8 +36,8 @@
+  */
+ int	ugidfw_accmode2mbi(accmode_t accmode);
+ int	ugidfw_check(struct ucred *cred, struct vnode *vp, struct vattr *vap,
+-	    int acc_mode);
+-int	ugidfw_check_vp(struct ucred *cred, struct vnode *vp, int acc_mode);
++	    int acc_mode, struct image_params *imgp);
++int	ugidfw_check_vp(struct ucred *cred, struct vnode *vp, int acc_mode, struct image_params *imgp);
+ 
+ /*
+  * System access control checks.
+diff --git a/sys/security/mac_bsdextended/ugidfw_system.c b/sys/security/mac_bsdextended/ugidfw_system.c
+index 49e4f1d..2829a00 100644
+--- a/sys/security/mac_bsdextended/ugidfw_system.c
++++ b/sys/security/mac_bsdextended/ugidfw_system.c
+@@ -66,7 +66,7 @@ ugidfw_system_check_acct(struct ucred *cred, struct vnode *vp,
+ {
+ 
+ 	if (vp != NULL)
+-		return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++		return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ 	else
+ 		return (0);
+ }
+@@ -77,7 +77,7 @@ ugidfw_system_check_auditctl(struct ucred *cred, struct vnode *vp,
+ {
+ 
+ 	if (vp != NULL)
+-		return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++		return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ 	else
+ 		return (0);
+ }
+@@ -87,5 +87,5 @@ ugidfw_system_check_swapon(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++	return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ }
+diff --git a/sys/security/mac_bsdextended/ugidfw_vnode.c b/sys/security/mac_bsdextended/ugidfw_vnode.c
+index 8ec2d48..2065e6e 100644
+--- a/sys/security/mac_bsdextended/ugidfw_vnode.c
++++ b/sys/security/mac_bsdextended/ugidfw_vnode.c
+@@ -65,7 +65,7 @@ ugidfw_vnode_check_access(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, accmode_t accmode)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, ugidfw_accmode2mbi(accmode)));
++	return (ugidfw_check_vp(cred, vp, ugidfw_accmode2mbi(accmode), NULL));
+ }
+ 
+ int
+@@ -73,7 +73,7 @@ ugidfw_vnode_check_chdir(struct ucred *cred, struct vnode *dvp,
+     struct label *dvplabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, dvp, MBI_EXEC));
++	return (ugidfw_check_vp(cred, dvp, MBI_EXEC, NULL));
+ }
+ 
+ int
+@@ -81,7 +81,7 @@ ugidfw_vnode_check_chroot(struct ucred *cred, struct vnode *dvp,
+     struct label *dvplabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, dvp, MBI_EXEC));
++	return (ugidfw_check_vp(cred, dvp, MBI_EXEC, NULL));
+ }
+ 
+ int
+@@ -89,7 +89,7 @@ ugidfw_check_create_vnode(struct ucred *cred, struct vnode *dvp,
+     struct label *dvplabel, struct componentname *cnp, struct vattr *vap)
+ {
+ 
+-	return (ugidfw_check_vp(cred, dvp, MBI_WRITE));
++	return (ugidfw_check_vp(cred, dvp, MBI_WRITE, NULL));
+ }
+ 
+ int
+@@ -97,7 +97,7 @@ ugidfw_vnode_check_deleteacl(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, acl_type_t type)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -105,7 +105,7 @@ ugidfw_vnode_check_deleteextattr(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, int attrnamespace, const char *name)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++	return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ }
+ 
+ int
+@@ -114,7 +114,7 @@ ugidfw_vnode_check_exec(struct ucred *cred, struct vnode *vp,
+     struct label *execlabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_READ|MBI_EXEC));
++	return (ugidfw_check_vp(cred, vp, MBI_READ|MBI_EXEC, imgp));
+ }
+ 
+ int
+@@ -122,7 +122,7 @@ ugidfw_vnode_check_getacl(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, acl_type_t type)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_STAT));
++	return (ugidfw_check_vp(cred, vp, MBI_STAT, NULL));
+ }
+ 
+ int
+@@ -130,7 +130,7 @@ ugidfw_vnode_check_getextattr(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, int attrnamespace, const char *name)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_READ));
++	return (ugidfw_check_vp(cred, vp, MBI_READ, NULL));
+ }
+ 
+ int
+@@ -140,10 +140,10 @@ ugidfw_vnode_check_link(struct ucred *cred, struct vnode *dvp,
+ {
+ 	int error;
+ 
+-	error = ugidfw_check_vp(cred, dvp, MBI_WRITE);
++	error = ugidfw_check_vp(cred, dvp, MBI_WRITE, NULL);
+ 	if (error)
+ 		return (error);
+-	error = ugidfw_check_vp(cred, vp, MBI_WRITE);
++	error = ugidfw_check_vp(cred, vp, MBI_WRITE, NULL);
+ 	if (error)
+ 		return (error);
+ 	return (0);
+@@ -154,7 +154,7 @@ ugidfw_vnode_check_listextattr(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, int attrnamespace)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_READ));
++	return (ugidfw_check_vp(cred, vp, MBI_READ, NULL));
+ }
+ 
+ int
+@@ -162,7 +162,7 @@ ugidfw_vnode_check_lookup(struct ucred *cred, struct vnode *dvp,
+     struct label *dvplabel, struct componentname *cnp)
+ {
+ 
+-	return (ugidfw_check_vp(cred, dvp, MBI_EXEC));
++	return (ugidfw_check_vp(cred, dvp, MBI_EXEC, NULL));
+ }
+ 
+ int
+@@ -170,7 +170,7 @@ ugidfw_vnode_check_open(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, accmode_t accmode)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, ugidfw_accmode2mbi(accmode)));
++	return (ugidfw_check_vp(cred, vp, ugidfw_accmode2mbi(accmode), NULL));
+ }
+ 
+ int
+@@ -178,7 +178,7 @@ ugidfw_vnode_check_readdir(struct ucred *cred, struct vnode *dvp,
+     struct label *dvplabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, dvp, MBI_READ));
++	return (ugidfw_check_vp(cred, dvp, MBI_READ, NULL));
+ }
+ 
+ int
+@@ -186,7 +186,7 @@ ugidfw_vnode_check_readdlink(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_READ));
++	return (ugidfw_check_vp(cred, vp, MBI_READ, NULL));
+ }
+ 
+ int
+@@ -196,10 +196,10 @@ ugidfw_vnode_check_rename_from(struct ucred *cred, struct vnode *dvp,
+ {
+ 	int error;
+ 
+-	error = ugidfw_check_vp(cred, dvp, MBI_WRITE);
++	error = ugidfw_check_vp(cred, dvp, MBI_WRITE, NULL);
+ 	if (error)
+ 		return (error);
+-	return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++	return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ }
+ 
+ int
+@@ -209,11 +209,11 @@ ugidfw_vnode_check_rename_to(struct ucred *cred, struct vnode *dvp,
+ {
+ 	int error;
+ 
+-	error = ugidfw_check_vp(cred, dvp, MBI_WRITE);
++	error = ugidfw_check_vp(cred, dvp, MBI_WRITE, NULL);
+ 	if (error)
+ 		return (error);
+ 	if (vp != NULL)
+-		error = ugidfw_check_vp(cred, vp, MBI_WRITE);
++		error = ugidfw_check_vp(cred, vp, MBI_WRITE, NULL);
+ 	return (error);
+ }
+ 
+@@ -222,7 +222,7 @@ ugidfw_vnode_check_revoke(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -230,7 +230,7 @@ ugidfw_check_setacl_vnode(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, acl_type_t type, struct acl *acl)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -238,7 +238,7 @@ ugidfw_vnode_check_setextattr(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, int attrnamespace, const char *name)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++	return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ }
+ 
+ int
+@@ -246,7 +246,7 @@ ugidfw_vnode_check_setflags(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, u_long flags)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -254,7 +254,7 @@ ugidfw_vnode_check_setmode(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, mode_t mode)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -262,7 +262,7 @@ ugidfw_vnode_check_setowner(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, uid_t uid, gid_t gid)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -270,7 +270,7 @@ ugidfw_vnode_check_setutimes(struct ucred *cred, struct vnode *vp,
+     struct label *vplabel, struct timespec atime, struct timespec utime)
+ {
+ 
+-	return (ugidfw_check_vp(cred, vp, MBI_ADMIN));
++	return (ugidfw_check_vp(cred, vp, MBI_ADMIN, NULL));
+ }
+ 
+ int
+@@ -278,7 +278,7 @@ ugidfw_vnode_check_stat(struct ucred *active_cred,
+     struct ucred *file_cred, struct vnode *vp, struct label *vplabel)
+ {
+ 
+-	return (ugidfw_check_vp(active_cred, vp, MBI_STAT));
++	return (ugidfw_check_vp(active_cred, vp, MBI_STAT, NULL));
+ }
+ 
+ int
+@@ -288,8 +288,8 @@ ugidfw_vnode_check_unlink(struct ucred *cred, struct vnode *dvp,
+ {
+ 	int error;
+ 
+-	error = ugidfw_check_vp(cred, dvp, MBI_WRITE);
++	error = ugidfw_check_vp(cred, dvp, MBI_WRITE, NULL);
+ 	if (error)
+ 		return (error);
+-	return (ugidfw_check_vp(cred, vp, MBI_WRITE));
++	return (ugidfw_check_vp(cred, vp, MBI_WRITE, NULL));
+ }
+diff --git a/sys/sparc64/sparc64/elf_machdep.c b/sys/sparc64/sparc64/elf_machdep.c
+index 4d55717..e0eba33 100644
+--- a/sys/sparc64/sparc64/elf_machdep.c
++++ b/sys/sparc64/sparc64/elf_machdep.c
+@@ -34,6 +34,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/kernel.h>
+ #include <sys/systm.h>
+@@ -52,6 +54,10 @@ __FBSDID("$FreeBSD$");
+ 
+ #include <machine/elf.h>
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ #include "linker_if.h"
+ 
+ static struct sysentvec elf64_freebsd_sysvec = {
+@@ -87,6 +93,11 @@ static struct sysentvec elf64_freebsd_sysvec = {
+ 	.sv_fetch_syscall_args = cpu_fetch_syscall_args,
+ 	.sv_syscallnames = syscallnames,
+ 	.sv_schedtail	= NULL,
++#ifdef PAX_ASLR
++	.sv_pax_aslr_init = _pax_aslr_init,
++#else
++	.sv_pax_aslr_init = NULL,
++#endif
+ };
+ 
+ static Elf64_Brandinfo freebsd_brand_info = {
+diff --git a/sys/sys/imgact.h b/sys/sys/imgact.h
+index 17cfcc2..15c2c4f 100644
+--- a/sys/sys/imgact.h
++++ b/sys/sys/imgact.h
+@@ -78,6 +78,7 @@ struct image_params {
+ 	unsigned long pagesizes;
+ 	int pagesizeslen;
+ 	vm_prot_t stack_prot;
++	int pax_flags;
+ };
+ 
+ #ifdef _KERNEL
+diff --git a/sys/sys/jail.h b/sys/sys/jail.h
+index 59d791c..d186c98 100644
+--- a/sys/sys/jail.h
++++ b/sys/sys/jail.h
+@@ -184,6 +184,21 @@ struct prison {
+ 	char		 pr_hostname[MAXHOSTNAMELEN];	/* (p) jail hostname */
+ 	char		 pr_domainname[MAXHOSTNAMELEN];	/* (p) jail domainname */
+ 	char		 pr_hostuuid[HOSTUUIDLEN];	/* (p) jail hostuuid */
++	int		 pr_pax_set;			/* () XXX */
++	int		 pr_pax_aslr_status;		/* () XXX */
++	int		 pr_pax_aslr_debug;		/* () XXX */
++	int		 pr_pax_aslr_mmap_len;		/* () XXX */
++	int		 pr_pax_aslr_stack_len;		/* () XXX */
++	int		 pr_pax_aslr_exec_len;		/* () XXX */
++	int		 pr_pax_aslr_compat_status;	/* () XXX */
++	int		 pr_pax_aslr_compat_mmap_len;	/* () XXX */
++	int		 pr_pax_aslr_compat_stack_len;	/* () XXX */
++	int		 pr_pax_aslr_compat_exec_len;	/* () XXX */
++	int		 pr_pax_segvguard_status;	/* () XXX */
++	int		 pr_pax_segvguard_debug;	/* () XXX */
++	int		 pr_pax_segvguard_expiry;	/* () XXX */
++	int		 pr_pax_segvguard_suspension;	/* () XXX */
++	int		 pr_pax_segvguard_maxcrashes;	/* () XXX */
+ };
+ 
+ struct prison_racct {
+diff --git a/sys/sys/pax.h b/sys/sys/pax.h
+new file mode 100644
+index 0000000..39361d3
+--- /dev/null
++++ b/sys/sys/pax.h
+@@ -0,0 +1,224 @@
++/*-
++ * Copyright (c) 2013, by Oliver Pinter <oliver.pntr at gmail.com>
++ * All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. The name of the developer may NOT be used to endorse or promote products
++ *    derived from this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
++ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
++ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
++ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
++ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
++ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
++ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
++ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
++ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
++ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
++ * SUCH DAMAGE.
++ *
++ * $FreeBSD$
++ *
++ * Enhancements made by Shawn "lattera" Webb under the direction of SoldierX.
++ */
++
++#ifndef	__SYS_PAX_H
++#define	__SYS_PAX_H
++
++struct image_params;
++struct prison;
++struct thread;
++struct vmspace;
++struct vm_offset_t;
++
++/*
++ * used in sysctl handler
++ */
++#define	PAX_ASLR_DISABLED		0
++#define PAX_ASLR_ENABLED		1
++#define PAX_ASLR_GLOBAL_ENABLED		2
++#define	PAX_ASLR_FORCE_GLOBAL_ENABLED	3
++
++#define PAX_SEGVGUARD_DISABLED              0
++#define PAX_SEGVGUARD_ENABLED               1
++#define PAX_SEGVGUARD_GLOBAL_ENABLED        2
++#define PAX_SEGVGUARD_FORCE_GLOBAL_ENABLED  3
++
++#ifndef PAX_ASLR_DELTA
++#define	PAX_ASLR_DELTA(delta, lsb, len)	\
++	(((delta) & ((1UL << (len)) - 1)) << (lsb))
++#endif /* PAX_ASLR_DELTA */
++
++#ifdef PAX_ASLR
++/*
++ * generic ASLR values
++ *
++ *  	MMAP	| 32 bit | 64 bit |
++ * 	+-------+--------+--------+
++ * 	| MIN	|  8 bit | 16 bit |
++ * 	+-------+--------+--------+
++ * 	| DEF	|  8 bit | 21 bit |
++ * 	+-------+--------+--------+
++ * 	| MAX   | 16 bit | 32 bit |
++ * 	+-------+--------+--------+
++ *
++ *  	STACK	| 32 bit | 64 bit |
++ * 	+-------+--------+--------+
++ * 	| MIN	|  6 bit | 12 bit |
++ * 	+-------+--------+--------+
++ * 	| DEF	|  6 bit | 16 bit |
++ * 	+-------+--------+--------+
++ * 	| MAX   | 10 bit | 21 bit |
++ * 	+-------+--------+--------+
++ *
++ *  	EXEC	| 32 bit | 64 bit |
++ * 	+-------+--------+--------+
++ * 	| MIN	|  6 bit | 12 bit |
++ * 	+-------+--------+--------+
++ * 	| DEF	|  6 bit | 21 bit |
++ * 	+-------+--------+--------+
++ * 	| MAX   | 10 bit | 21 bit |
++ * 	+-------+--------+--------+
++ *
++ */
++#ifndef PAX_ASLR_DELTA_MMAP_LSB
++#define PAX_ASLR_DELTA_MMAP_LSB		PAGE_SHIFT
++#endif /* PAX_ASLR_DELTA_MMAP_LSB */
++
++#ifndef PAX_ASLR_DELTA_MMAP_MIN_LEN
++#define PAX_ASLR_DELTA_MMAP_MIN_LEN	((sizeof(void *) * NBBY) / 4)
++#endif /* PAX_ASLR_DELTA_MMAP_MAX_LEN */
++
++#ifndef PAX_ASLR_DELTA_MMAP_MAX_LEN
++#define PAX_ASLR_DELTA_MMAP_MAX_LEN	((sizeof(void *) * NBBY) / 2)
++#endif /* PAX_ASLR_DELTA_MMAP_MAX_LEN */
++
++#ifndef PAX_ASLR_DELTA_STACK_LSB
++#define PAX_ASLR_DELTA_STACK_LSB	3
++#endif /* PAX_ASLR_DELTA_STACK_LSB */
++
++#ifndef PAX_ASLR_DELTA_STACK_MIN_LEN
++#define PAX_ASLR_DELTA_STACK_MIN_LEN	((sizeof(void *) * NBBY) / 5)
++#endif /* PAX_ASLR_DELTA_STACK_MAX_LEN */
++
++#ifndef PAX_ASLR_DELTA_STACK_MAX_LEN
++#define PAX_ASLR_DELTA_STACK_MAX_LEN	((sizeof(void *) * NBBY) / 3)
++#endif /* PAX_ASLR_DELTA_STACK_MAX_LEN */
++
++#ifndef PAX_ASLR_DELTA_EXEC_LSB
++#define PAX_ASLR_DELTA_EXEC_LSB		PAGE_SHIFT
++#endif /* PAX_ASLR_DELTA_EXEC_LSB */
++
++#ifndef PAX_ASLR_DELTA_EXEC_MIN_LEN
++#define PAX_ASLR_DELTA_EXEC_MIN_LEN	((sizeof(void *) * NBBY) / 5)
++#endif /* PAX_ASLR_DELTA_EXEC_MAX_LEN */
++
++#ifndef PAX_ASLR_DELTA_EXEC_MAX_LEN
++#define PAX_ASLR_DELTA_EXEC_MAX_LEN	((sizeof(void *) * NBBY) / 3)
++#endif /* PAX_ASLR_DELTA_EXEC_MAX_LEN */
++
++/*
++ * ASLR default values for native host
++ */
++#ifdef __amd64__
++#ifndef PAX_ASLR_DELTA_MMAP_DEF_LEN
++#define PAX_ASLR_DELTA_MMAP_DEF_LEN	21
++#endif /* PAX_ASLR_DELTA_MMAP_DEF_LEN */
++#ifndef PAX_ASLR_DELTA_STACK_DEF_LEN
++#define PAX_ASLR_DELTA_STACK_DEF_LEN	16
++#endif /* PAX_ASLR_DELTA_STACK_DEF_LEN */
++#ifndef PAX_ASLR_DELTA_EXEC_DEF_LEN
++#define PAX_ASLR_DELTA_EXEC_DEF_LEN	21
++#endif /* PAX_ASLR_DELTA_EXEC_DEF_LEN */
++#else
++#ifndef PAX_ASLR_DELTA_MMAP_DEF_LEN	PAX_ASLR_DELTA_MMAP_MIN_LEN
++#define PAX_ASLR_DELTA_MMAP_DEF_LEN
++#endif /* PAX_ASLR_DELTA_MMAP_DEF_LEN */
++#ifndef PAX_ASLR_DELTA_STACK_DEF_LEN
++#define PAX_ASLR_DELTA_STACK_DEF_LEN	PAX_ASLR_DELTA_STACK_MIN_LEN
++#endif /* PAX_ASLR_DELTA_STACK_DEF_LEN */
++#ifndef PAX_ASLR_DELTA_EXEC_DEF_LEN
++#define PAX_ASLR_DELTA_EXEC_DEF_LEN	PAX_ASLR_DELTA_EXEC_MIN_LEN
++#endif /* PAX_ASLR_DELTA_EXEC_DEF_LEN */
++#endif /* __amd64__ */
++
++/*
++ * ASLR values for COMPAT_FREEBSD32 and COMPAT_LINUX
++ */
++#ifndef PAX_ASLR_COMPAT_DELTA_MMAP_LSB
++#define PAX_ASLR_COMPAT_DELTA_MMAP_LSB		PAGE_SHIFT
++#endif /* PAX_ASLR_COMPAT_DELTA_MMAP_LSB */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_MMAP_MIN_LEN
++#define PAX_ASLR_COMPAT_DELTA_MMAP_MIN_LEN	((sizeof(int) * NBBY) / 4)
++#endif /* PAX_ASLR_COMPAT_DELTA_MMAP_MAX_LEN */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_MMAP_MAX_LEN
++#define PAX_ASLR_COMPAT_DELTA_MMAP_MAX_LEN	((sizeof(int) * NBBY) / 2)
++#endif /* PAX_ASLR_COMPAT_DELTA_MMAP_MAX_LEN */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_STACK_LSB
++#define PAX_ASLR_COMPAT_DELTA_STACK_LSB		3
++#endif /* PAX_ASLR_COMPAT_DELTA_STACK_LSB */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_STACK_MIN_LEN
++#define PAX_ASLR_COMPAT_DELTA_STACK_MIN_LEN	((sizeof(int) * NBBY) / 5)
++#endif /* PAX_ASLR_COMPAT_DELTA_STACK_MAX_LEN */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_STACK_MAX_LEN
++#define PAX_ASLR_COMPAT_DELTA_STACK_MAX_LEN	((sizeof(int) * NBBY) / 3)
++#endif /* PAX_ASLR_COMPAT_DELTA_STACK_MAX_LEN */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_EXEC_MIN_LEN
++#define PAX_ASLR_COMPAT_DELTA_EXEC_MIN_LEN	((sizeof(int) * NBBY) / 5)
++#endif /* PAX_ASLR_COMPAT_DELTA_EXEC_MAX_LEN */
++
++#ifndef PAX_ASLR_COMPAT_DELTA_EXEC_MAX_LEN
++#define PAX_ASLR_COMPAT_DELTA_EXEC_MAX_LEN	((sizeof(int) * NBBY) / 3)
++#endif /* PAX_ASLR_COMPAT_DELTA_EXEC_MAX_LEN */
++
++extern int pax_aslr_status;
++extern int pax_aslr_debug;
++
++extern int pax_aslr_mmap_len;
++extern int pax_aslr_stack_len;
++extern int pax_aslr_exec_len;
++#ifdef COMPAT_FREEBSD32
++extern int pax_aslr_compat_status;
++extern int pax_aslr_compat_mmap_len;
++extern int pax_aslr_compat_stack_len;
++extern int pax_aslr_compat_exec_len;
++#endif /* COMPAT_FREEBSD32 */
++#endif /* PAX_ASLR */
++
++#define ELF_NOTE_TYPE_PAX_TAG   3
++#define ELF_NOTE_PAX_MPROTECT   0x01
++#define ELF_NOTE_PAX_NOMPROTECT 0x02
++#define ELF_NOTE_PAX_GUARD      0x04
++#define ELF_NOTE_PAX_NOGUARD    0x08
++#define ELF_NOTE_PAX_ASLR       0x10
++#define ELF_NOTE_PAX_NOASLR     0x20
++
++#define PAX_SEGVGUARD_EXPIRY        (2 * 60)
++#define PAX_SEGVGUARD_SUSPENSION    (10 * 60)
++#define PAX_SEGVGUARD_MAXCRASHES    5
++
++void pax_init(void);
++void pax_init_prison(struct prison *pr);
++bool pax_aslr_active(struct thread *td, struct proc *proc);
++void _pax_aslr_init(struct vmspace *vm, struct prison *pr);
++void _pax_aslr_init32(struct vmspace *vm, struct prison *pr);
++void pax_aslr_init(struct thread *td, struct image_params *imgp);
++void pax_aslr_mmap(struct thread *td, vm_offset_t *addr,
++			vm_offset_t orig_addr, int flags);
++void pax_aslr_stack(struct thread *td, uintptr_t *addr, uintptr_t orig_addr);
++struct prison *pax_get_prison(struct thread *td, struct proc *proc);
++void pax_elf(struct image_params *, uint32_t);
++int pax_segvguard(struct thread *, struct vnode *, char *, bool);
++
++#endif /* __SYS_PAX_H */
+diff --git a/sys/sys/proc.h b/sys/sys/proc.h
+index a0fd11c..b8c0faa 100644
+--- a/sys/sys/proc.h
++++ b/sys/sys/proc.h
+@@ -538,6 +538,7 @@ struct proc {
+ 	u_int		p_stops;	/* (c) Stop event bitmask. */
+ 	u_int		p_stype;	/* (c) Stop event type. */
+ 	char		p_step;		/* (c) Process is stopped. */
++	u_int		p_pax;		/* (b) PaX is enabled to this process */
+ 	u_char		p_pfsflags;	/* (c) Procfs flags. */
+ 	struct nlminfo	*p_nlminfo;	/* (?) Only used by/for lockd. */
+ 	struct kaioinfo	*p_aioinfo;	/* (y) ASYNC I/O info. */
+diff --git a/sys/sys/sysent.h b/sys/sys/sysent.h
+index c49db41..cfbcdc0 100644
+--- a/sys/sys/sysent.h
++++ b/sys/sys/sysent.h
+@@ -77,9 +77,11 @@ struct sysent {			/* system call table */
+ #define	SY_THR_INCR	0x8
+ 
+ struct image_params;
++struct prison;
+ struct __sigset;
+ struct syscall_args;
+ struct trapframe;
++struct vmspace;
+ struct vnode;
+ 
+ struct sysentvec {
+@@ -130,6 +132,7 @@ struct sysentvec {
+ 	uint32_t	sv_timekeep_gen;
+ 	void		*sv_shared_page_obj;
+ 	void		(*sv_schedtail)(struct thread *);
++	void		(*sv_pax_aslr_init)(struct vmspace *vm, struct prison *pr);
+ };
+ 
+ #define	SV_ILP32	0x000100
+diff --git a/sys/vm/vm_map.c b/sys/vm/vm_map.c
+index a6a500d..310dde6 100644
+--- a/sys/vm/vm_map.c
++++ b/sys/vm/vm_map.c
+@@ -65,6 +65,8 @@
+ #include <sys/cdefs.h>
+ __FBSDID("$FreeBSD$");
+ 
++#include "opt_pax.h"
++
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/kernel.h>
+@@ -289,6 +291,12 @@ vmspace_alloc(vm_offset_t min, vm_offset_t max, pmap_pinit_t pinit)
+ 	vm->vm_taddr = 0;
+ 	vm->vm_daddr = 0;
+ 	vm->vm_maxsaddr = 0;
++#ifdef PAX_ASLR
++	vm->vm_aslr_delta_mmap = 0;
++	vm->vm_aslr_delta_stack = 0;
++	vm->vm_aslr_delta_exec = 0;
++#endif
++
+ 	return (vm);
+ }
+ 
+diff --git a/sys/vm/vm_map.h b/sys/vm/vm_map.h
+index 850bf25..4524c9f 100644
+--- a/sys/vm/vm_map.h
++++ b/sys/vm/vm_map.h
+@@ -241,6 +241,9 @@ struct vmspace {
+ 	caddr_t vm_taddr;	/* (c) user virtual address of text */
+ 	caddr_t vm_daddr;	/* (c) user virtual address of data */
+ 	caddr_t vm_maxsaddr;	/* user VA at max stack growth */
++	vm_size_t vm_aslr_delta_mmap;	/* mmap() random delta for ASLR */
++	vm_size_t vm_aslr_delta_stack;	/* stack random delta for ASLR */
++	vm_size_t vm_aslr_delta_exec;	/* exec base random delta for ASLR */
+ 	volatile int vm_refcnt;	/* number of references */
+ 	/*
+ 	 * Keep the PMAP last, so that CPU-specific variations of that
+diff --git a/sys/vm/vm_mmap.c b/sys/vm/vm_mmap.c
+index 60aa621..12c8448 100644
+--- a/sys/vm/vm_mmap.c
++++ b/sys/vm/vm_mmap.c
+@@ -45,6 +45,7 @@ __FBSDID("$FreeBSD$");
+ 
+ #include "opt_compat.h"
+ #include "opt_hwpmc_hooks.h"
++#include "opt_pax.h"
+ 
+ #include <sys/param.h>
+ #include <sys/systm.h>
+@@ -91,6 +92,10 @@ __FBSDID("$FreeBSD$");
+ #include <sys/pmckern.h>
+ #endif
+ 
++#ifdef PAX_ASLR
++#include <sys/pax.h>
++#endif
++
+ int old_mlock = 0;
+ SYSCTL_INT(_vm, OID_AUTO, old_mlock, CTLFLAG_RW | CTLFLAG_TUN, &old_mlock, 0,
+     "Do not apply RLIMIT_MEMLOCK on mlockall");
+@@ -203,6 +208,9 @@ sys_mmap(td, uap)
+ 	struct file *fp;
+ 	struct vnode *vp;
+ 	vm_offset_t addr;
++#ifdef PAX_ASLR
++	vm_offset_t orig_addr;
++#endif
+ 	vm_size_t size, pageoff;
+ 	vm_prot_t cap_maxprot, prot, maxprot;
+ 	void *handle;
+@@ -213,6 +221,9 @@ sys_mmap(td, uap)
+ 	cap_rights_t rights;
+ 
+ 	addr = (vm_offset_t) uap->addr;
++#ifdef PAX_ASLR
++	orig_addr = addr;
++#endif
+ 	size = uap->len;
+ 	prot = uap->prot & VM_PROT_ALL;
+ 	flags = uap->flags;
+@@ -309,9 +320,10 @@ sys_mmap(td, uap)
+ 		if (addr == 0 ||
+ 		    (addr >= round_page((vm_offset_t)vms->vm_taddr) &&
+ 		    addr < round_page((vm_offset_t)vms->vm_daddr +
+-		    lim_max(td->td_proc, RLIMIT_DATA))))
++		    lim_max(td->td_proc, RLIMIT_DATA)))) {
+ 			addr = round_page((vm_offset_t)vms->vm_daddr +
+ 			    lim_max(td->td_proc, RLIMIT_DATA));
++		}
+ 		PROC_UNLOCK(td->td_proc);
+ 	}
+ 	if (flags & MAP_ANON) {
+@@ -414,6 +426,9 @@ sys_mmap(td, uap)
+ map:
+ 	td->td_fpop = fp;
+ 	maxprot &= cap_maxprot;
++#ifdef PAX_ASLR
++	pax_aslr_mmap(td, &addr, orig_addr, flags);
++#endif
+ 	error = vm_mmap(&vms->vm_map, &addr, size, prot, maxprot,
+ 	    flags, handle_type, handle, pos);
+ 	td->td_fpop = NULL;
+diff --git a/tools/build/options/WITHOUT_PIE b/tools/build/options/WITHOUT_PIE
+new file mode 100644
+index 0000000..0086873
+--- /dev/null
++++ b/tools/build/options/WITHOUT_PIE
+@@ -0,0 +1,31 @@
++Enable building of Position-Independent Executables (PIEs) for the following applications:
++    libexec/getty
++    sbin/casperd
++    sbin/dhclient
++    sbin/hastd
++    sbin/natd
++    sbin/nfsiod
++    sbin/rtsol
++    usr/sbin/auditd
++    usr/sbin/auditdistd
++    usr/sbin/bsnmpd
++    usr/sbin/ctld
++    usr/sbin/daemon
++    usr/sbin/iscsid
++    usr/sbin/jail
++    usr/sbin/jexec
++    usr/sbin/mountd
++    usr/sbin/moused
++    usr/sbin/nfsd
++    usr/sbin/nfsuserd
++    usr/sbin/powerd
++    usr/sbin/rpc.lockd
++    usr/sbin/rpc.statd
++    usr/sbin/rpc.yppasswdd
++    usr/sbin/rpc.ypupdated
++    usr/sbin/rpc.ypxfrd
++    usr/sbin/rpcbind
++    usr/sbin/sshd
++    usr/sbin/syslogd
++    usr/sbin/tcpdump
++    usr/sbin/watchdogd
+diff --git a/usr.sbin/apmd/Makefile b/usr.sbin/apmd/Makefile
+index 9a0dc0d..130de88 100644
+--- a/usr.sbin/apmd/Makefile
++++ b/usr.sbin/apmd/Makefile
+@@ -5,6 +5,8 @@ MAN=	apmd.8
+ MANSUBDIR= /i386
+ SRCS=	apmd.c apmdlex.l apmdparse.y y.tab.h
+ 
++CAN_PIE=1
++
+ WARNS?=	3
+ 
+ DPADD=	${LIBL}
+diff --git a/usr.sbin/auditd/Makefile b/usr.sbin/auditd/Makefile
+index 47ffd0b..5f3ab75 100644
+--- a/usr.sbin/auditd/Makefile
++++ b/usr.sbin/auditd/Makefile
+@@ -5,6 +5,8 @@
+ OPENBSMDIR=${.CURDIR}/../../contrib/openbsm
+ .PATH: ${OPENBSMDIR}/bin/auditd
+ 
++CAN_PIE=1
++
+ CFLAGS+=	-I${OPENBSMDIR}
+ 
+ PROG=	auditd
+diff --git a/usr.sbin/auditdistd/Makefile b/usr.sbin/auditdistd/Makefile
+index ee18bca..c5504ae 100644
+--- a/usr.sbin/auditdistd/Makefile
++++ b/usr.sbin/auditdistd/Makefile
+@@ -5,6 +5,8 @@
+ OPENBSMDIR=${.CURDIR}/../../contrib/openbsm
+ .PATH: ${OPENBSMDIR}/bin/auditdistd
+ 
++CAN_PIE=1
++
+ # Addition of auditdistd because otherwise generated parse.c can't find
+ # auditdistd.h.  This seems like a makefile non-feature.
+ CFLAGS+=-I${OPENBSMDIR} -I${OPENBSMDIR}/bin/auditdistd
+diff --git a/usr.sbin/bsnmpd/bsnmpd/Makefile b/usr.sbin/bsnmpd/bsnmpd/Makefile
+index b20ba31..da09d5c 100644
+--- a/usr.sbin/bsnmpd/bsnmpd/Makefile
++++ b/usr.sbin/bsnmpd/bsnmpd/Makefile
+@@ -18,6 +18,8 @@ CLEANFILES= oid.h tree.c tree.h
+ MAN=	bsnmpd.1 snmpmod.3
+ NO_WERROR=
+ 
++CAN_PIE=1
++
+ FILESGROUPS= BMIBS DEFS
+ 
+ BMIBS=	FOKUS-MIB.txt BEGEMOT-MIB.txt BEGEMOT-SNMPD.txt
+diff --git a/usr.sbin/ctld/Makefile b/usr.sbin/ctld/Makefile
+index e6c292d..3ad951e 100644
+--- a/usr.sbin/ctld/Makefile
++++ b/usr.sbin/ctld/Makefile
+@@ -9,6 +9,8 @@ CFLAGS+=	-I${.CURDIR}/../../sys/dev/iscsi
+ #CFLAGS+=	-DICL_KERNEL_PROXY
+ MAN=		ctld.8 ctl.conf.5
+ 
++CAN_PIE=1
++
+ DPADD=		${LIBCAM} ${LIBSBUF} ${LIBBSDXML} ${LIBUTIL}
+ LDADD=		-lbsdxml -lcam -lcrypto -lfl -lsbuf -lssl -lutil
+ 
+diff --git a/usr.sbin/daemon/Makefile b/usr.sbin/daemon/Makefile
+index 2def803..fe5e392 100644
+--- a/usr.sbin/daemon/Makefile
++++ b/usr.sbin/daemon/Makefile
+@@ -3,6 +3,8 @@
+ PROG=	daemon
+ MAN=	daemon.8
+ 
++CAN_PIE=1
++
+ DPADD=	${LIBUTIL}
+ LDADD=	-lutil
+ 
+diff --git a/usr.sbin/iscsid/Makefile b/usr.sbin/iscsid/Makefile
+index 468b284..b9dff8c 100644
+--- a/usr.sbin/iscsid/Makefile
++++ b/usr.sbin/iscsid/Makefile
+@@ -8,6 +8,8 @@ CFLAGS+=	-I${.CURDIR}/../../sys/dev/iscsi
+ #CFLAGS+=	-DICL_KERNEL_PROXY
+ MAN=		iscsid.8
+ 
++CAN_PIE=1
++
+ DPADD=		${LIBUTIL}
+ LDADD=		-lcrypto -lssl -lutil
+ 
+diff --git a/usr.sbin/jail/Makefile b/usr.sbin/jail/Makefile
+index 58324ac..c8de2c6 100644
+--- a/usr.sbin/jail/Makefile
++++ b/usr.sbin/jail/Makefile
+@@ -6,6 +6,8 @@ PROG=	jail
+ MAN=	jail.8 jail.conf.5
+ SRCS=	jail.c command.c config.c state.c jailp.h jaillex.l jailparse.y y.tab.h
+ 
++CAN_PIE=1
++
+ DPADD=	${LIBJAIL} ${LIBKVM} ${LIBUTIL} ${LIBL}
+ LDADD=	-ljail -lkvm -lutil -ll
+ 
+diff --git a/usr.sbin/jexec/Makefile b/usr.sbin/jexec/Makefile
+index 7a2e6821..ddd3a76 100644
+--- a/usr.sbin/jexec/Makefile
++++ b/usr.sbin/jexec/Makefile
+@@ -5,4 +5,6 @@ MAN=	jexec.8
+ DPADD=	${LIBJAIL} ${LIBUTIL}
+ LDADD=	-ljail -lutil
+ 
++CAN_PIE=1
++
+ .include <bsd.prog.mk>
+diff --git a/usr.sbin/mountd/Makefile b/usr.sbin/mountd/Makefile
+index c141d8a..0068a1f 100644
+--- a/usr.sbin/mountd/Makefile
++++ b/usr.sbin/mountd/Makefile
+@@ -5,6 +5,8 @@ PROG=	mountd
+ SRCS=	mountd.c getmntopts.c
+ MAN=	exports.5 netgroup.5 mountd.8
+ 
++CAN_PIE=1
++
+ MOUNT=  ${.CURDIR}/../../sbin/mount
+ CFLAGS+= -I${MOUNT}
+ WARNS?= 2
+diff --git a/usr.sbin/moused/Makefile b/usr.sbin/moused/Makefile
+index a313a21..f478ef7 100644
+--- a/usr.sbin/moused/Makefile
++++ b/usr.sbin/moused/Makefile
+@@ -3,6 +3,8 @@
+ PROG=	moused
+ MAN=	moused.8
+ 
++CAN_PIE=1
++
+ DPADD=	${LIBUTIL}  ${LIBM}
+ LDADD=	-lutil -lm
+ 
+diff --git a/usr.sbin/nfsd/Makefile b/usr.sbin/nfsd/Makefile
+index 2905067..9f9f678 100644
+--- a/usr.sbin/nfsd/Makefile
++++ b/usr.sbin/nfsd/Makefile
+@@ -4,4 +4,6 @@
+ PROG=	nfsd
+ MAN=	nfsd.8 nfsv4.4 stablerestart.5
+ 
++CAN_PIE=1
++
+ .include <bsd.prog.mk>
+diff --git a/usr.sbin/nfsuserd/Makefile b/usr.sbin/nfsuserd/Makefile
+index 6153449..f2955f0 100644
+--- a/usr.sbin/nfsuserd/Makefile
++++ b/usr.sbin/nfsuserd/Makefile
+@@ -4,4 +4,6 @@ PROG=	nfsuserd
+ MAN=	nfsuserd.8
+ WARNS?=	3
+ 
++CAN_PIE=1
++
+ .include <bsd.prog.mk>
+diff --git a/usr.sbin/powerd/Makefile b/usr.sbin/powerd/Makefile
+index 62f8da1..0c9081b 100644
+--- a/usr.sbin/powerd/Makefile
++++ b/usr.sbin/powerd/Makefile
+@@ -3,6 +3,8 @@
+ PROG=	powerd
+ MAN=	powerd.8
+ 
++CAN_PIE=1
++
+ DPADD=	${LIBUTIL}
+ LDADD=	-lutil
+ 
+diff --git a/usr.sbin/rpc.lockd/Makefile b/usr.sbin/rpc.lockd/Makefile
+index 139f4bc..d1fe289 100644
+--- a/usr.sbin/rpc.lockd/Makefile
++++ b/usr.sbin/rpc.lockd/Makefile
+@@ -6,6 +6,8 @@ MAN=	rpc.lockd.8
+ MLINKS=	rpc.lockd.8 lockd.8
+ SRCS=	kern.c nlm_prot_svc.c lockd.c lock_proc.c lockd_lock.c
+ 
++CAN_PIE=1
++
+ CFLAGS+= -I. -I${DESTDIR}/usr/include/rpcsvc
+ WARNS?= 3
+ 
+diff --git a/usr.sbin/rpc.statd/Makefile b/usr.sbin/rpc.statd/Makefile
+index 6fa2b1e..794098a 100644
+--- a/usr.sbin/rpc.statd/Makefile
++++ b/usr.sbin/rpc.statd/Makefile
+@@ -4,6 +4,8 @@ PROG=	rpc.statd
+ MAN=	rpc.statd.8
+ SRCS=	file.c sm_inter_svc.c sm_inter.h statd.c procs.c
+ 
++CAN_PIE=1
++
+ CFLAGS+= -I.
+ WARNS?= 2
+ 
+diff --git a/usr.sbin/rpc.yppasswdd/Makefile b/usr.sbin/rpc.yppasswdd/Makefile
+index a9d3a75..f9d6ee9 100644
+--- a/usr.sbin/rpc.yppasswdd/Makefile
++++ b/usr.sbin/rpc.yppasswdd/Makefile
+@@ -14,6 +14,8 @@ SRCS=	util.c yp_access.c yp_dblookup.c yp_dbwrite.c \
+ GENSRCS=yp.h yp_clnt.c yppasswd.h yppasswd_private.h yppasswd_private_svc.c \
+ 	yppasswd_private_xdr.c yppasswd_svc.c
+ 
++CAN_PIE=1
++
+ WARNS?=	 5
+ CFLAGS+= -fno-strict-aliasing
+ CFLAGS+= -I${.CURDIR}/../../usr.sbin/vipw \
+diff --git a/usr.sbin/rpc.ypupdated/Makefile b/usr.sbin/rpc.ypupdated/Makefile
+index 03c1142..f751e25 100644
+--- a/usr.sbin/rpc.ypupdated/Makefile
++++ b/usr.sbin/rpc.ypupdated/Makefile
+@@ -8,6 +8,8 @@ SRCS=	ypupdate_prot_svc.c ypupdate_prot.h ypupdated_main.c \
+ 	yp_error.c update.c ypupdated_server.c \
+ 	yp_dblookup.c yp_dbwrite.c yp_dbdelete.c yp_dbupdate.c
+ 
++CAN_PIE=1
++
+ #CFLAGS+= -DYP
+ CFLAGS+= -I${.CURDIR}/../ypserv -I. -I${.CURDIR}/../../libexec/ypxfr
+ 
+diff --git a/usr.sbin/rpc.ypxfrd/Makefile b/usr.sbin/rpc.ypxfrd/Makefile
+index 05971b1..ed243bb 100644
+--- a/usr.sbin/rpc.ypxfrd/Makefile
++++ b/usr.sbin/rpc.ypxfrd/Makefile
+@@ -7,6 +7,8 @@ MAN=	rpc.ypxfrd.8
+ SRCS=	ypxfrd_svc.c ypxfrd.h ypxfrd_server.c yp_error.c \
+ 	yp_access.c ypxfrd_main.c
+ 
++CAN_PIE=1
++
+ CFLAGS+= -I. -DXFRBLOCKSIZE=65535
+ 
+ WARNS?=	2
+diff --git a/usr.sbin/rpcbind/Makefile b/usr.sbin/rpcbind/Makefile
+index 2780001..304204a 100644
+--- a/usr.sbin/rpcbind/Makefile
++++ b/usr.sbin/rpcbind/Makefile
+@@ -8,6 +8,8 @@ MAN=	rpcbind.8
+ SRCS=	check_bound.c rpcb_stat.c rpcb_svc_4.c rpcbind.c pmap_svc.c \
+ 	rpcb_svc.c rpcb_svc_com.c security.c warmstart.c util.c
+ 
++CAN_PIE=1
++
+ CFLAGS+= -DPORTMAP -DLIBWRAP
+ 
+ .if ${MK_INET6_SUPPORT} != "no"
+diff --git a/usr.sbin/syslogd/Makefile b/usr.sbin/syslogd/Makefile
+index 069e093..022048d 100644
+--- a/usr.sbin/syslogd/Makefile
++++ b/usr.sbin/syslogd/Makefile
+@@ -9,6 +9,8 @@ PROG=	syslogd
+ MAN=	syslog.conf.5 syslogd.8
+ SRCS=	syslogd.c ttymsg.c
+ 
++CAN_PIE=1
++
+ DPADD=	${LIBUTIL}
+ LDADD=	-lutil
+ 
+diff --git a/usr.sbin/tcpdump/tcpdump/Makefile b/usr.sbin/tcpdump/tcpdump/Makefile
+index 4982873..a65e866 100644
+--- a/usr.sbin/tcpdump/tcpdump/Makefile
++++ b/usr.sbin/tcpdump/tcpdump/Makefile
+@@ -7,6 +7,8 @@ TCPDUMP_DISTDIR?= ${.CURDIR}/../../../contrib/tcpdump
+ 
+ PROG=	tcpdump
+ 
++CAN_PIE=1
++
+ SRCS=	addrtoname.c \
+ 	af.c \
+ 	checksum.c \
+diff --git a/usr.sbin/ugidfw/ugidfw.c b/usr.sbin/ugidfw/ugidfw.c
+index 977922a..515df16 100644
+--- a/usr.sbin/ugidfw/ugidfw.c
++++ b/usr.sbin/ugidfw/ugidfw.c
+@@ -46,6 +46,8 @@ __FBSDID("$FreeBSD$");
+ #include <string.h>
+ #include <ugidfw.h>
+ 
++#define UGIDFW_BUFSIZ (BUFSIZ*2)
++
+ void add_rule(int argc, char *argv[]);
+ void list_rules(void);
+ void remove_rule(int argc, char *argv[]);
+@@ -71,22 +73,22 @@ usage(void)
+ void
+ add_rule(int argc, char *argv[])
+ {
+-	char errstr[BUFSIZ], charstr[BUFSIZ];
++	char errstr[UGIDFW_BUFSIZ], charstr[UGIDFW_BUFSIZ];
+ 	struct mac_bsdextended_rule rule;
+ 	int error, rulenum;
+ 
+-	error = bsde_parse_rule(argc, argv, &rule, BUFSIZ, errstr);
++	error = bsde_parse_rule(argc, argv, &rule, UGIDFW_BUFSIZ, errstr);
+ 	if (error) {
+ 		warnx("%s", errstr);
+ 		return;
+ 	}
+ 
+-	error = bsde_add_rule(&rulenum, &rule, BUFSIZ, errstr);
++	error = bsde_add_rule(&rulenum, &rule, UGIDFW_BUFSIZ, errstr);
+ 	if (error) {
+ 		warnx("%s", errstr);
+ 		return;
+ 	}
+-	if (bsde_rule_to_string(&rule, charstr, BUFSIZ) == -1)
++	if (bsde_rule_to_string(&rule, charstr, UGIDFW_BUFSIZ) == -1)
+ 		warnx("Added rule, but unable to print string.");
+ 	else
+ 		printf("%d %s\n", rulenum, charstr);
+@@ -95,25 +97,25 @@ add_rule(int argc, char *argv[])
+ void
+ list_rules(void)
+ {
+-	char errstr[BUFSIZ], charstr[BUFSIZ];
++	char errstr[UGIDFW_BUFSIZ], charstr[UGIDFW_BUFSIZ];
+ 	struct mac_bsdextended_rule rule;
+ 	int error, i, rule_count, rule_slots;
+ 
+-	rule_slots = bsde_get_rule_slots(BUFSIZ, errstr);
++	rule_slots = bsde_get_rule_slots(UGIDFW_BUFSIZ, errstr);
+ 	if (rule_slots == -1) {
+ 		warnx("unable to get rule slots; mac_bsdextended.ko "
+ 		    "may not be loaded");
+ 		errx(1, "bsde_get_rule_slots: %s", errstr);
+ 	}
+ 
+-	rule_count = bsde_get_rule_count(BUFSIZ, errstr);
++	rule_count = bsde_get_rule_count(UGIDFW_BUFSIZ, errstr);
+ 	if (rule_count == -1)
+ 		errx(1, "bsde_get_rule_count: %s", errstr);
+ 
+ 	printf("%d slots, %d rules\n", rule_slots, rule_count);
+ 
+ 	for (i = 0; i < rule_slots; i++) {
+-		error = bsde_get_rule(i, &rule, BUFSIZ, errstr);
++		error = bsde_get_rule(i, &rule, UGIDFW_BUFSIZ, errstr);
+ 		switch (error) {
+ 		case -2:
+ 			continue;
+@@ -124,7 +126,7 @@ list_rules(void)
+ 			break;
+ 		}
+ 
+-		if (bsde_rule_to_string(&rule, charstr, BUFSIZ) == -1)
++		if (bsde_rule_to_string(&rule, charstr, UGIDFW_BUFSIZ) == -1)
+ 			warnx("unable to translate rule %d to string", i);
+ 		else
+ 			printf("%d %s\n", i, charstr);
+@@ -134,7 +136,7 @@ list_rules(void)
+ void
+ set_rule(int argc, char *argv[])
+ {
+-	char errstr[BUFSIZ];
++	char errstr[UGIDFW_BUFSIZ];
+ 	struct mac_bsdextended_rule rule;
+ 	long value;
+ 	int error, rulenum;
+@@ -152,13 +154,13 @@ set_rule(int argc, char *argv[])
+ 
+ 	rulenum = value;
+ 
+-	error = bsde_parse_rule(argc - 1, argv + 1, &rule, BUFSIZ, errstr);
++	error = bsde_parse_rule(argc - 1, argv + 1, &rule, UGIDFW_BUFSIZ, errstr);
+ 	if (error) {
+ 		warnx("%s", errstr);
+ 		return;
+ 	}
+ 
+-	error = bsde_set_rule(rulenum, &rule, BUFSIZ, errstr);
++	error = bsde_set_rule(rulenum, &rule, UGIDFW_BUFSIZ, errstr);
+ 	if (error) {
+ 		warnx("%s", errstr);
+ 		return;
+@@ -168,7 +170,7 @@ set_rule(int argc, char *argv[])
+ void
+ remove_rule(int argc, char *argv[])
+ {
+-	char errstr[BUFSIZ];
++	char errstr[UGIDFW_BUFSIZ];
+ 	long value;
+ 	int error, rulenum;
+ 	char *endp;
+@@ -185,7 +187,7 @@ remove_rule(int argc, char *argv[])
+ 
+ 	rulenum = value;
+ 
+-	error = bsde_delete_rule(rulenum, BUFSIZ, errstr);
++	error = bsde_delete_rule(rulenum, UGIDFW_BUFSIZ, errstr);
+ 	if (error)
+ 		warnx("%s", errstr);
+ }
+diff --git a/usr.sbin/watchdogd/Makefile b/usr.sbin/watchdogd/Makefile
+index 5df7946..8ced729 100644
+--- a/usr.sbin/watchdogd/Makefile
++++ b/usr.sbin/watchdogd/Makefile
+@@ -4,6 +4,8 @@ PROG=	watchdogd
+ LINKS=	${BINDIR}/watchdogd ${BINDIR}/watchdog
+ MAN=	watchdogd.8 watchdog.8
+ 
++CAN_PIE=1
++
+ LDADD=	-lutil
+ DPADD=	${LIBUTIL}
+ 
